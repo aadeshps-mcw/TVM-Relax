@@ -26,6 +26,10 @@
 #include <tvm/ir/module.h>
 
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "../codegen_json/codegen_json.h"
 #include "../utils.h"
@@ -38,7 +42,47 @@ using JSONGraphNode = tvm::runtime::json::JSONGraphNode;
 using JSONGraphNodeEntry = tvm::runtime::json::JSONGraphNodeEntry;
 using JSONSerializer = backend::contrib::JSONSerializer;
 using backend::contrib::NodeEntries;
+namespace {
 
+/*!
+ * \brief Resolves a composite pattern name (e.g. "dnnl.conv2d_bias_relu") to the
+ * CallNode for its underlying root op inside the composite function.
+ *
+ * Exact-match entries are used for patterns that have no fused variants sharing
+ * a name prefix (matmul, layer_norm). Prefix-match entries are used for op
+ * families with fused variants that all legitimately share a root op (the
+ * conv2d family: dnnl.conv2d, dnnl.conv2d_relu, dnnl.conv2d_bias_relu, ...).
+ *
+ * Prefix matching is deliberately anchored at the start of the string
+ * (not a substring search) so that, e.g., a future "dnnl.qnn.conv2d" pattern
+ * does not incorrectly match the "dnnl.conv2d" prefix.
+ */
+const CallNode* ResolveRootCall(const std::string& composite_name, const Function& fn) {
+  static const std::unordered_map<std::string, std::string> kExactResolvers = {
+      {"dnnl.matmul", "relax.matmul"},
+      {"dnnl.layer_norm", "relax.nn.layer_norm"},
+  };
+  static const std::vector<std::pair<std::string, std::string>> kPrefixResolvers = {
+      {"dnnl.conv2d", "relax.nn.conv2d"},
+  };
+
+  auto exact_it = kExactResolvers.find(composite_name);
+  if (exact_it != kExactResolvers.end()) {
+    return backend::GetOpInFunction(fn, exact_it->second);
+  }
+
+  for (const auto& prefix_and_op : kPrefixResolvers) {
+    const std::string& prefix = prefix_and_op.first;
+    if (composite_name.rfind(prefix, 0) == 0) {  // composite_name starts with prefix
+      return backend::GetOpInFunction(fn, prefix_and_op.second);
+    }
+  }
+
+  TVM_FFI_THROW(InternalError) << "Unimplemented pattern: " << composite_name;
+  return nullptr;
+}
+
+}  // namespace
 class DNNLJSONSerializer : public JSONSerializer {
  public:
   DNNLJSONSerializer(ffi::Map<Constant, ffi::String> constant_names, ffi::Map<Var, Expr> bindings)
@@ -57,20 +101,71 @@ class DNNLJSONSerializer : public JSONSerializer {
 
     std::string composite_name = composite_opt.value();
 
-    NodeEntries inputs;
-    for (const auto& arg : call_node->args) {
-      auto res = VisitExpr(arg);
-      inputs.insert(inputs.end(), res.begin(), res.end());
+    // Map each composite-function parameter to the entries already produced
+    // for the corresponding argument at the outer call site.
+    std::unordered_map<const VarNode*, NodeEntries> param_entries;
+    for (size_t i = 0; i < fn->params.size(); ++i) {
+      param_entries[fn->params[i].get()] = VisitExpr(call_node->args[i]);
     }
+
+    NodeEntries inputs;
+    std::unordered_set<const ffi::Object*> seen;
+
+    auto add_leaf_if_new = [&](const Expr& e) {
+      const ffi::Object* key = e.get();
+      if (seen.count(key)) return;
+      if (const auto* var_node = e.as<VarNode>()) {
+        auto it = param_entries.find(var_node);
+        if (it == param_entries.end()) return;  // internal binding var, not a leaf
+        seen.insert(key);
+        inputs.insert(inputs.end(), it->second.begin(), it->second.end());
+      } else if (e.as<ConstantNode>()) {
+        seen.insert(key);
+        auto res = VisitExpr(e);
+        inputs.insert(inputs.end(), res.begin(), res.end());
+      }
+    };
+
+    const auto* seq = fn->body.as<SeqExprNode>();
+    TVM_FFI_ICHECK(seq) << "Expected composite function body to be a SeqExpr.";
+    for (const auto& block : seq->blocks) {
+      for (const auto& binding : block->bindings) {
+        const auto* var_binding = binding.as<VarBindingNode>();
+        TVM_FFI_ICHECK(var_binding) << "Expected VarBinding inside composite function.";
+        if (const auto* inner_call = var_binding->value.as<CallNode>()) {
+          for (const auto& arg : inner_call->args) {
+            add_leaf_if_new(arg);
+          }
+        }
+      }
+    }
+
     auto node = std::make_shared<JSONGraphNode>(composite_name, /* name_ */
                                                 "kernel",       /* op_type_ */
                                                 inputs, 1 /* num_outputs_ */);
 
-    const CallNode* root_call = nullptr;
-    if (composite_name.find("conv2d") != std::string::npos) {
-      root_call = backend::GetOpInFunction(fn, "relax.nn.conv2d");
-    } else {
-      TVM_FFI_THROW(InternalError) << "Unimplemented pattern: " << composite_name;
+    const CallNode* root_call = ResolveRootCall(composite_name, fn);
+
+    // clip's bounds are plain TIR FloatImm call args in Relax (relax.clip(x, min, max)),
+    // not op attrs, so SetCallNodeAttribute(node, root_call) below -- which only extracts
+    // the *root op's* own attrs (e.g. conv2d's strides/padding) -- never sees them.
+    // Extract them here and attach as "a_min"/"a_max" JSON attrs, which is what the DNNL
+    // runtime's ParseAttrs() fallback (dnnl_json_runtime.cc) reads for "_clip"-suffixed
+    // composites. Without this, clip silently runs with bounds (0, 0).
+    if (composite_name.find("_clip") != std::string::npos) {
+      const CallNode* clip_call = backend::GetOpInFunction(fn, "relax.clip");
+      TVM_FFI_ICHECK(clip_call) << "Expected to find relax.clip inside composite "
+                                << composite_name;
+      TVM_FFI_ICHECK_EQ(clip_call->args.size(), 3U)
+          << "Expected relax.clip(x, min, max) to have 3 args";
+
+      const auto* min_imm = clip_call->args[1].as<FloatImmNode>();
+      const auto* max_imm = clip_call->args[2].as<FloatImmNode>();
+      TVM_FFI_ICHECK(min_imm) << "Expected relax.clip's min arg to be a FloatImm";
+      TVM_FFI_ICHECK(max_imm) << "Expected relax.clip's max arg to be a FloatImm";
+
+      node->SetAttr("a_min", min_imm->value);
+      node->SetAttr("a_max", max_imm->value);
     }
 
     SetCallNodeAttribute(node, root_call);

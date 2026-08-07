@@ -139,18 +139,21 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
 
  private:
   const std::map<std::string, dnnl::algorithm> elt_name2algo{
-      {"abs", dnnl::algorithm::eltwise_abs},
-      {"exp", dnnl::algorithm::eltwise_exp},
-      {"log", dnnl::algorithm::eltwise_log},
-      {"sqrt", dnnl::algorithm::eltwise_sqrt},
-      {"round", dnnl::algorithm::eltwise_round},
+      // {"abs", dnnl::algorithm::eltwise_abs},
+      // {"exp", dnnl::algorithm::eltwise_exp},
+      // {"log", dnnl::algorithm::eltwise_log},
+      // {"sqrt", dnnl::algorithm::eltwise_sqrt},
+      // {"round", dnnl::algorithm::eltwise_round},
       // {"logsumexp", dnnl::algorithm::eltwise_logsigmoid},
       {"nn.relu", dnnl::algorithm::eltwise_relu},
-      {"nn.leaky_relu", dnnl::algorithm::eltwise_relu},
+      // {"nn.leaky_relu", dnnl::algorithm::eltwise_relu},
       {"tanh", dnnl::algorithm::eltwise_tanh},
       {"sigmoid", dnnl::algorithm::eltwise_logistic},
-      {"clip", dnnl::algorithm::eltwise_clip},
-      {"gelu_erf", dnnl::algorithm::eltwise_gelu_erf},
+      {"nn.swish", dnnl::algorithm::eltwise_swish},
+      {"nn.mish", dnnl::algorithm::eltwise_mish},
+      {"nn.gelu", dnnl::algorithm::eltwise_gelu_erf},
+      // {"clip", dnnl::algorithm::eltwise_clip},
+      // {"gelu_erf", dnnl::algorithm::eltwise_gelu_erf},
   };
 
   dnnl::primitive_attr ParseAttrs(const size_t& nid, TensorRequisite* bias_tr) {
@@ -211,11 +214,11 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     if (contains(op_name, "_tanh")) {
       ops.append_eltwise(dnnl::algorithm::eltwise_tanh, 0.f, 0.f);
     }
-    if (contains(op_name, "_clip")) {
-      float a_min = GetNodeAttr<float>(nodes_[nid], "a_min");
-      float a_max = GetNodeAttr<float>(nodes_[nid], "a_max");
-      ops.append_eltwise(dnnl::algorithm::eltwise_clip, a_min, a_max);
-    }
+    // if (contains(op_name, "_clip")) {
+    //   float a_min = GetNodeAttr<float>(nodes_[nid], "a_min");
+    //   float a_max = GetNodeAttr<float>(nodes_[nid], "a_max");
+    //   ops.append_eltwise(dnnl::algorithm::eltwise_clip, a_min, a_max);
+    // }
     if (contains(op_name, "_sigmoid")) {
       ops.append_eltwise(dnnl::algorithm::eltwise_logistic, 0.f, 0.f);
     }
@@ -252,20 +255,12 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
       if (node.GetOpType() == "kernel") {
         TVM_FFI_ICHECK_EQ(node.GetOpType(), "kernel");
         auto op_name = node.GetOpName();
-        if (contains_any(op_name, "conv1d", "conv2d", "conv3d")) {
+        if (contains_any(op_name, "conv2d_transpose", "conv3d_transpose")) {
+          Deconvolution(nid);
+        } else if (contains_any(op_name, "conv1d", "conv2d", "conv3d")) {
           Convolution(nid);
-        } else {
-          TVM_FFI_THROW(InternalError)
-              << "Unsupported op during porting (only conv2d is active): " << op_name;
         }
-
-        // if (contains_any(op_name, "deconv1d", "deconv2d", "deconv3d", "conv1d_transpose",
-        //                  "conv2d_transpose", "conv3d_transpose")) {
-        //   Deconvolution(nid);
-        // } else if (contains_any(op_name, "conv1d", "conv2d", "conv3d")) {
-        //   std::cout<<"found conv\n";
-        //   Convolution(nid);
-        // } else if (contains(op_name, "dense")) {
+        // else if (contains(op_name, "dense")) {
         //   Dense(nid);
         // } else if ("nn.batch_norm" == op_name) {
         //   BatchNorm(nid);
@@ -285,9 +280,10 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
         //   LayerNorm(nid);
         // } else if ("nn.batch_matmul" == op_name) {
         //   BatchMatMul(nid);
-        // } else {
-        //   TVM_FFI_THROW(InternalError) << "Unsupported op: " << op_name;
         // }
+        else {
+          TVM_FFI_THROW(InternalError) << "Unsupported op: " << op_name;
+        }
       }
     }
   }
@@ -387,73 +383,65 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
            {sum_in_tr, DNNL_ARG_DST});
   }
 
-  // void Deconvolution(const size_t& nid) {
-  //   auto node = nodes_[nid];
-  //
-  //   // Setup attributes.
-  //   auto src_tr = GetInput(nid, 0);
-  //   auto wgh_tr = GetInput(nid, 1);
-  //   auto dst_tr = GetOutput(nid, 0);
-  //   auto bias_tr = TensorRequisite{};
-  //
-  //   auto attr = ParseAttrs(nid, &bias_tr);
-  //   attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
-  //
-  //   auto strides = GetNodeAttr<std::vector<int64_t>>(node, "strides");
-  //   auto dilates = GetNodeAttr<std::vector<int64_t>>(node, "dilation");
-  //   auto padding = GetNodeAttr<std::vector<int64_t>>(node, "padding");
-  //   std::vector<int64_t> padding_l(padding.begin(), padding.begin() + padding.size() / 2);
-  //   std::vector<int64_t> padding_r(padding.begin() + padding.size() / 2, padding.end());
-  //   auto groups = GetNodeAttr<int>(node, "groups");
-  //   auto src_layout = GetNodeAttr<std::string>(node, "data_layout");
-  //   auto dst_layout = GetNodeAttr<std::string>(node, "out_layout");
-  //   auto wgh_layout = GetNodeAttr<std::string>(node, "kernel_layout");
-  //
-  //   // dst_layout == "" means to use data_layout
-  //   if (dst_layout.empty()) dst_layout = src_layout;
-  //
-  //   // Minus one for DNNL representation. No dilation for DNNL is 0, for relax is 1.
-  //   for (auto& d : dilates) d--;
-  //
-  //   // Take into account provided layout strings
-  //   src_tr = src_tr.TreatAs(src_layout);
-  //   dst_tr = dst_tr.TreatAs(dst_layout);
-  //   wgh_tr = wgh_tr.TreatAs(wgh_layout);
-  //
-  //   // Should support G mixed with O. Like { G*O, I, H, W }
-  //   if (wgh_layout.find("G") == std::string::npos) {
-  //     auto w_dims = wgh_tr.dims();
-  //     w_dims[0] /= groups;
-  //     w_dims.insert(w_dims.begin(), groups);
-  //     wgh_tr = wgh_tr.Reshape(w_dims);
-  //   }
-  //
-  //   // Assumption that bias is correct and can be squeezed to 1D
-  //   bias_tr = bias_tr.Reshape({dst_tr.dims()[1]});
-  //
-  //   // Conv description.
-  //   auto deconv_desc = dnnl::deconvolution_forward::desc(
-  //       dnnl::prop_kind::forward_inference, dnnl::algorithm::deconvolution_direct,
-  //       src_tr.LayoutAny().desc(), wgh_tr.LayoutAny().desc(), bias_tr.LayoutAny().desc(),
-  //       dst_tr.LayoutAny().desc(), strides, dilates, padding_l, padding_r);
-  //
-  //   // Enable elementwise post-ops.
-  //   auto deconv_prim_desc = dnnl::deconvolution_forward::primitive_desc(deconv_desc, attr,
-  //   engine_);
-  //
-  //   src_tr = src_tr.RequestLayout(deconv_prim_desc.src_desc());
-  //   wgh_tr = wgh_tr.RequestLayout(deconv_prim_desc.weights_desc());
-  //   dst_tr = dst_tr.RequestLayout(deconv_prim_desc.dst_desc());
-  //   bias_tr = bias_tr.RequestLayout(deconv_prim_desc.bias_desc());
-  //
-  //   auto scratchpad_tr = TensorRequisite::AsIs(deconv_prim_desc.scratchpad_desc());
-  //
-  //   Submit(dnnl::deconvolution_forward(deconv_prim_desc), {{DNNL_ARG_SRC, src_tr},
-  //                                                          {DNNL_ARG_WEIGHTS, wgh_tr},
-  //                                                          {DNNL_ARG_BIAS, bias_tr},
-  //                                                          {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
-  //                                                          {DNNL_ARG_DST, dst_tr}});
-  // }
+  void Deconvolution(const size_t& nid) {
+    auto node = nodes_[nid];
+
+    // Setup attributes.
+    auto src_tr = GetInput(nid, 0);
+    auto wgh_tr = GetInput(nid, 1);
+    auto dst_tr = GetOutput(nid, 0);
+    auto bias_tr = TensorRequisite{};
+
+    auto attr = ParseAttrs(nid, &bias_tr);
+    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+
+    auto strides = GetNodeAttr<std::vector<int64_t>>(node, "strides");
+    auto dilates = GetNodeAttr<std::vector<int64_t>>(node, "dilation");
+    auto padding = GetNodeAttr<std::vector<int64_t>>(node, "padding");
+    std::vector<int64_t> padding_l(padding.begin(), padding.begin() + padding.size() / 2);
+    std::vector<int64_t> padding_r(padding.begin() + padding.size() / 2, padding.end());
+    auto groups = GetNodeAttr<int>(node, "groups");
+    auto src_layout = GetNodeAttr<std::string>(node, "data_layout");
+    auto dst_layout = GetNodeAttr<std::string>(node, "out_layout");
+    auto wgh_layout = GetNodeAttr<std::string>(node, "kernel_layout");
+
+    // dst_layout == "" means to use data_layout
+    if (dst_layout.empty()) dst_layout = src_layout;
+
+    // Minus one for DNNL representation. No dilation for DNNL is 0, for relax is 1.
+    for (auto& d : dilates) d--;
+    src_tr = src_tr.TreatAs(src_layout);
+    dst_tr = dst_tr.TreatAs(dst_layout);
+    wgh_tr = wgh_tr.TreatAs(wgh_layout);
+
+    // Should support G mixed with O. Like { G*O, I, H, W }
+    if (wgh_layout.find("G") == std::string::npos) {
+      auto w_dims = wgh_tr.dims();
+      w_dims[0] /= groups;
+      w_dims.insert(w_dims.begin(), groups);
+      wgh_tr = wgh_tr.Reshape(w_dims);
+    }
+    bias_tr = bias_tr.Reshape({dst_tr.dims()[1]});
+
+    // Deconv description -- oneDNN v3 API: constructor-based primitive_desc
+    auto deconv_prim_desc = dnnl::deconvolution_forward::primitive_desc(
+        engine_, dnnl::prop_kind::forward_inference, dnnl::algorithm::deconvolution_direct,
+        src_tr.LayoutAny().desc(), wgh_tr.LayoutAny().desc(), bias_tr.LayoutAny().desc(),
+        dst_tr.LayoutAny().desc(), strides, dilates, padding_l, padding_r, attr);
+
+    src_tr = src_tr.RequestLayout(deconv_prim_desc.src_desc());
+    wgh_tr = wgh_tr.RequestLayout(deconv_prim_desc.weights_desc());
+    dst_tr = dst_tr.RequestLayout(deconv_prim_desc.dst_desc());
+    bias_tr = bias_tr.RequestLayout(deconv_prim_desc.bias_desc());
+
+    auto scratchpad_tr = TensorRequisite::AsIs(deconv_prim_desc.scratchpad_desc());
+
+    Submit(dnnl::deconvolution_forward(deconv_prim_desc), {{DNNL_ARG_SRC, src_tr},
+                                                           {DNNL_ARG_WEIGHTS, wgh_tr},
+                                                           {DNNL_ARG_BIAS, bias_tr},
+                                                           {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
+                                                           {DNNL_ARG_DST, dst_tr}});
+  }
 
   // void Dense(const size_t& nid) {
   //   auto node = nodes_[nid];

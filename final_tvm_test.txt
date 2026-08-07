@@ -41,4 +41,4 @@ tests/python/relax/test_codegen_dnnl.py::test_dnnl_resnet18_offloaded_and_numeri
     return cls.__new__(cls, *args)
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-======================= 24 passed, 6 warnings in 15.69s ========================
+======================= 24 passed, 6 warnings in 13.77s ========================

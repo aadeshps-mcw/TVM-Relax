@@ -27,6 +27,7 @@ if(IS_DIRECTORY ${USE_DNNL})
     tvm_file_glob(GLOB DNNL_CONTRIB_SRC src/runtime/extra/contrib/dnnl/dnnl_json_runtime.cc
                                         src/runtime/extra/contrib/dnnl/dnnl_utils.cc
                                         src/runtime/extra/contrib/dnnl/dnnl.cc
+                                        src/runtime/extra/contrib/dnnl/dnnl_layout_query.cc
                                         src/runtime/extra/contrib/cblas/dnnl_blas.cc)
     add_library(tvm_dnnl_objs OBJECT ${DNNL_CONTRIB_SRC})
     target_link_libraries(tvm_dnnl_objs PRIVATE tvm_runtime_extra_defs)
@@ -41,6 +42,7 @@ elseif((USE_DNNL STREQUAL "ON") OR (USE_DNNL STREQUAL "JSON"))
   find_library(EXTERN_LIBRARY_DNNL dnnl)
   tvm_file_glob(GLOB DNNL_CONTRIB_SRC src/runtime/extra/contrib/dnnl/dnnl_json_runtime.cc
                                       src/runtime/extra/contrib/dnnl/dnnl_utils.cc
+                                      src/runtime/extra/contrib/dnnl/dnnl_layout_query.cc
                                       src/runtime/extra/contrib/dnnl/dnnl.cc
                                       src/runtime/extra/contrib/cblas/dnnl_blas.cc)
   add_library(tvm_dnnl_objs OBJECT ${DNNL_CONTRIB_SRC})
@@ -51,6 +53,7 @@ elseif(USE_DNNL STREQUAL "C_SRC")
   find_library(EXTERN_LIBRARY_DNNL dnnl)
   tvm_file_glob(GLOB DNNL_CONTRIB_SRC src/runtime/extra/contrib/dnnl/dnnl.cc
                                       src/runtime/extra/contrib/dnnl/dnnl_utils.cc
+                                      src/runtime/extra/contrib/dnnl/dnnl_layout_query.cc
                                       src/runtime/extra/contrib/cblas/dnnl_blas.cc)
   add_library(tvm_dnnl_objs OBJECT ${DNNL_CONTRIB_SRC})
   target_link_libraries(tvm_dnnl_objs PRIVATE tvm_runtime_extra_defs)

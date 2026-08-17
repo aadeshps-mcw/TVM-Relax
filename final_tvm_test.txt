@@ -1,0 +1,44 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0 -- /home/mcw/miniconda3/envs/tvm-build-relax/bin/python
+cachedir: .pytest_cache
+rootdir: /home/mcw/dhinesh/tvm/tvm-mcw/tvm
+configfile: pyproject.toml
+collecting ... collected 24 items
+
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv1d PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv1d_grouped PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv1d_strided PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv2d[alter_layout] PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv2d[plain_layout] PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv2d_grouped[groups2] PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv2d_grouped[depthwise] PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv2d_dilated PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv2d_relu_fused PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv3d PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv3d_grouped PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv3d_strided PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv2d_transpose PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv2d_transpose_strided PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv3d_transpose PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv3d_transpose_strided PASSED
+tests/python/relax/test_codegen_dnnl.py::test_partition_for_dnnl_conv2d_stack PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_custom_convnet_offloaded_and_numerically_correct PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_custom_convnet3_offloaded_and_numerically_correct PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv1d_model_offloaded_and_numerically_correct PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv3d_model_offloaded_and_numerically_correct PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv2d_transpose_model_offloaded_and_numerically_correct PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv3d_transpose_model_offloaded_and_numerically_correct PASSED
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_resnet18_offloaded_and_numerically_correct PASSED
+
+=============================== warnings summary ===============================
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_custom_convnet_offloaded_and_numerically_correct
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_custom_convnet3_offloaded_and_numerically_correct
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv1d_model_offloaded_and_numerically_correct
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv3d_model_offloaded_and_numerically_correct
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_conv2d_transpose_model_offloaded_and_numerically_correct
+tests/python/relax/test_codegen_dnnl.py::test_dnnl_resnet18_offloaded_and_numerically_correct
+  /home/mcw/miniconda3/envs/tvm-build-relax/lib/python3.11/copyreg.py:105: FutureWarning: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+    return cls.__new__(cls, *args)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================= 24 passed, 6 warnings in 13.77s ========================

@@ -37,6 +37,8 @@ requires_dnnl_codegen = pytest.mark.skipif(
 
 pytestmark = [requires_dnnl_codegen]
 
+torch = pytest.importorskip("torch")
+
 
 def build_and_run(mod, inputs_np, target, legalize=False):
     with tvm.transform.PassContext(config={"relax.transform.apply_legalize_ops": legalize}):

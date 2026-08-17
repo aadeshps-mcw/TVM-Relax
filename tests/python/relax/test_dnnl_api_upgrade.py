@@ -30,9 +30,8 @@ import tvm
 from tvm import relax
 from tvm.relax.backend.contrib.dnnl import partition_for_dnnl
 
-
-
 # Module builder
+
 
 def _make_conv2d_module(
     data_shape,
@@ -67,19 +66,27 @@ def _make_conv2d_module(
         with builder.dataflow():
             conv = builder.emit(
                 relax.op.nn.conv2d(
-                    data, weight, strides=list(strides), padding=list(padding), dilation=list(dilation), groups=groups, out_dtype=out_dtype or dtype,
+                    data,
+                    weight,
+                    strides=list(strides),
+                    padding=list(padding),
+                    dilation=list(dilation),
+                    groups=groups,
+                    out_dtype=out_dtype or dtype,
                 )
             )
             out = builder.emit_output(conv)
         builder.emit_func_output(out)
     return builder.get(), weight_shape
-import torch
+
+
+torch = pytest.importorskip("torch")
 import torch.nn as nn
+
 from tvm.relax.frontend.torch import from_exported_program
 
-
-
 # Helper: convert a torch.nn.Module into a Relax IRModule via torch.export
+
 
 def _torch_module_to_relax(torch_model, example_input):
     torch_model.eval()
@@ -90,8 +97,9 @@ def _torch_module_to_relax(torch_model, example_input):
     return mod, params["main"]
 
 
-def _compile_and_compare_model(torch_model, example_input, alter_layout=True,
-                                rtol=1e-3, atol=1e-3, min_dnnl_funcs=1):
+def _compile_and_compare_model(
+    torch_model, example_input, alter_layout=True, rtol=1e-3, atol=1e-3, min_dnnl_funcs=1
+):
     """Same idea as _compile_and_compare, but for a full torch model instead
     of a hand-built single-op graph:
       1. Get PyTorch's own eager output -- this is the ground truth here.
@@ -128,10 +136,11 @@ def _compile_and_compare_model(torch_model, example_input, alter_layout=True,
     out = vm["main"](*tvm_args)
     assert len(out) == 1
     res = out[0].numpy()
-    np.testing.assert_allclose(res, torch_out, rtol=rtol, atol = atol)
+    np.testing.assert_allclose(res, torch_out, rtol=rtol, atol=atol)
 
     # np.testing.assert_allclose(out, torch_out, rtol=rtol, atol=atol)
     return res, torch_out
+
 
 class _TinyConvNet3(nn.Module):
     def __init__(self):
@@ -153,8 +162,10 @@ class _TinyConvNet3(nn.Module):
         x = torch.flatten(x, 1)
         return x
 
+
 # Custom small CNN -- multiple conv2d layers + pooling + a non-conv op,
 # so segregation actually has something interesting to segregate
+
 
 class _TinyConvNet(nn.Module):
     def __init__(self):
@@ -176,6 +187,7 @@ def test_custom_convnet_conv_offloaded_and_numerically_correct():
     example_input = torch.randn(1, 3, 32, 32)
     _compile_and_compare_model(model, example_input, alter_layout=True, min_dnnl_funcs=1)
 
+
 def test_custom_convnet_three_conv_offloaded():
     model = _TinyConvNet3()
     example_input = torch.randn(1, 3, 32, 32)
@@ -187,9 +199,11 @@ def test_custom_convnet_three_conv_offloaded():
         min_dnnl_funcs=1,
     )
 
+
 # Pretrained ResNet-18 -- exercises Crop()/TreatAs() across many real
 # conv2d shapes (stem conv, stride-2 downsample convs, 1x1 shortcut convs,
 # varying channel counts) all at once, inside one realistic model.
+
 
 def test_resnet18_conv_offloaded_and_numerically_correct():
     torchvision = pytest.importorskip("torchvision")
@@ -202,6 +216,7 @@ def test_resnet18_conv_offloaded_and_numerically_correct():
 
 
 # Shared numeric-verification helper
+
 
 def _compile_and_compare(mod, params_np, alter_layout=True, rtol=1e-4, atol=1e-4):
     """Runs `mod` two ways -- (1) plain, unpartitioned TVM as ground truth, and
@@ -234,8 +249,19 @@ def _compile_and_compare(mod, params_np, alter_layout=True, rtol=1e-4, atol=1e-4
     return out, ref_out
 
 
-def _run_conv2d_case(data_shape, out_channels, groups=1, kernel_size=(3, 3),
-                      strides=(1, 1), padding=(1, 1), dilation=(1,1), dtype="float32", out_dtype = None, alter_layout=True, seed=0):
+def _run_conv2d_case(
+    data_shape,
+    out_channels,
+    groups=1,
+    kernel_size=(3, 3),
+    strides=(1, 1),
+    padding=(1, 1),
+    dilation=(1, 1),
+    dtype="float32",
+    out_dtype=None,
+    alter_layout=True,
+    seed=0,
+):
     np.random.seed(seed)
     mod, weight_shape = _make_conv2d_module(
         data_shape=data_shape,
@@ -245,7 +271,7 @@ def _run_conv2d_case(data_shape, out_channels, groups=1, kernel_size=(3, 3),
         strides=strides,
         padding=padding,
         dilation=dilation,
-        dtype = dtype,
+        dtype=dtype,
         out_dtype=out_dtype,
     )
     data_np = np.random.uniform(size=data_shape).astype("float32")
@@ -253,8 +279,8 @@ def _run_conv2d_case(data_shape, out_channels, groups=1, kernel_size=(3, 3),
     return _compile_and_compare(mod, [data_np, weight_np], alter_layout=alter_layout)
 
 
-
 # Crop() coverage -- grouped / depthwise convolution
+
 
 # Crop() slices a combined weight tensor into per-group sub-views before each
 # group's convolution runs (dnnl::memory::desc::submemory_desc() in the fixed
@@ -323,6 +349,7 @@ def test_conv2d_crop_grouped_batch_variants(batch):
         seed=2,
     )
 
+
 @pytest.mark.parametrize(
     "in_channels,out_channels,groups",
     [
@@ -340,6 +367,7 @@ def test_conv2d_crop_treatas_large_channel_counts(in_channels, out_channels, gro
         seed=9,
     )
 
+
 @pytest.mark.parametrize("dilation", [(1, 1), (2, 2), (3, 3)])
 def test_conv2d_treatas_dilation_variants(dilation):
     """Dilation changes the effective kernel footprint oneDNN sees, which
@@ -355,6 +383,7 @@ def test_conv2d_treatas_dilation_variants(dilation):
         alter_layout=True,
         seed=7,
     )
+
 
 @pytest.mark.parametrize(
     "kernel_size,strides,padding",
@@ -377,7 +406,9 @@ def test_conv2d_treatas_asymmetric_variants(kernel_size, strides, padding):
         seed=8,
     )
 
+
 # TreatAs() coverage -- layout / format_tag resolution
+
 
 # TreatAs() is exercised whenever the DNNL runtime reinterprets a tensor's
 # buffer under a different (often blocked) layout -- primarily triggered
@@ -468,8 +499,8 @@ def test_conv2d_treatas_batch_and_spatial_variants(data_shape, weight_channels):
     )
 
 
-
 # Combined Crop() + TreatAs() interaction -- highest-risk case
+
 
 # When `alter_layout=True` AND `groups > 1` together, oneDNN may request a
 # *blocked* layout for the combined weight tensor before Crop() slices it
@@ -500,6 +531,7 @@ def test_conv2d_crop_treatas_interaction_grouped_with_altered_layout(
         seed=6,
     )
 
+
 # ---------------------------------------------------------------------------
 # Dtype coverage
 # ---------------------------------------------------------------------------
@@ -514,14 +546,17 @@ DTYPE_CASES = [
     pytest.param("bfloat16", "bfloat16", id="bf16"),
     pytest.param("int8", "int32", id="s8"),
     pytest.param("uint8", "int32", id="u8"),
-    pytest.param("int32", "int32", id="s32"),  # confirm this is a real input dtype, not just an accumulator dtype, before trusting it
+    pytest.param(
+        "int32", "int32", id="s32"
+    ),  # confirm this is a real input dtype, not just an accumulator dtype, before trusting it
 ]
+
 
 def _random_for_dtype(shape, dtype):
     if dtype in ("float32", "float16"):
         return np.random.uniform(-1, 1, size=shape).astype(dtype)
     if dtype == "bfloat16":
-        import ml_dtypes
+        ml_dtypes = pytest.importorskip("ml_dtypes")
         return np.random.uniform(-1, 1, size=shape).astype(ml_dtypes.bfloat16)
     if dtype == "int8":
         return np.random.randint(-128, 128, size=shape).astype("int8")
@@ -537,15 +572,18 @@ def test_conv2d_crop_treatas_dtype_variants(dtype, out_dtype):
     np.random.seed(10)
     data_shape = (1, 16, 16, 16)
     mod, weight_shape = _make_conv2d_module(
-        data_shape=data_shape, out_channels=32, groups=4,  # groups keeps Crop() in play
-        dtype=dtype, out_dtype=out_dtype,
+        data_shape=data_shape,
+        out_channels=32,
+        groups=4,  # groups keeps Crop() in play
+        dtype=dtype,
+        out_dtype=out_dtype,
     )
     data_np = _random_for_dtype(data_shape, dtype)
     weight_np = _random_for_dtype(weight_shape, dtype)
     _compile_and_compare(mod, [data_np, weight_np], alter_layout=True, rtol=1e-2, atol=1e-2)
 
+
 if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
-

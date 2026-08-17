@@ -45,8 +45,6 @@ def _dnnl_patterns() -> list[Pattern]:
     patterns: list[Pattern] = []
 
     patterns.append(_op_pattern("dnnl.conv2d", "relax.nn.conv2d", 2))
-    patterns.append(_op_pattern("dnnl.matmul", "relax.matmul", 2))
-    patterns.append(_op_pattern("dnnl.layer_norm", "relax.nn.layer_norm", 3))
 
     # 2. Fused Ops
     pat_conv_relu = make_fused_bias_activation_pattern(
@@ -121,8 +119,6 @@ _DNNL_COMPUTE_OPS = {
     "relax.nn.conv3d",
     "relax.nn.conv2d_transpose",
     "relax.nn.conv3d_transpose",
-    "relax.matmul",
-    "relax.nn.layer_norm",
 }
 
 

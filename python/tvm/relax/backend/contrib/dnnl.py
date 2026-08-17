@@ -223,7 +223,7 @@ def rewrite_dense_bias_gelu_reshape_last(mod: tvm.IRModule) -> tvm.IRModule:
         const3 = wildcard()
 
         den = is_op("relax.matmul")(data_pat, weight_pat)
-        re_den = is_op("relax.reshape")(den)
+        re_den = is_op("relax.reshape")(den, wildcard())
         added = is_op("relax.add")(bias_pat, re_den)
 
         if has_gelu:

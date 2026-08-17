@@ -21,23 +21,23 @@
  * \file src/relax/backend/contrib/dnnl/codegen.cc
  * \brief Implementation of the DNNL JSON serializer.
  *
- * Unlike TensorRT's composite functions (which always wrap exactly one primitive op), a DNNL
- * composite represents a *fused chain* -- e.g. "dnnl.conv2d_bias_relu" contains three primitive
- * calls: conv2d, add (bias), relu. So there is no single "root call" to resolve by name.
- * Baseline for this file is TensorRT's codegen.cc: instead of matching composite_name (or an op
- * name) against a table to decide which call to extract attrs from, we walk every binding in the
- * composite body once and, for every primitive call found:
- *   - copy its op attrs via the existing SetCallNodeAttribute() helper (same helper the original
- *     conv2d-only code used for its single root_call)
- *   - serialize its non-tensor scalar/shape arguments as "arg_<name>" attrs -- this is what
- *     replaces the old hardcoded "_clip" check; relax.clip's min/max are call args, not attrs,
- *     and this now applies to any op with such args, not just clip
- *   - append its op name to a "fused_ops" attr, so the runtime knows the fusion sequence without
- *     codegen needing a hardcoded list of which ops DNNL supports as post-ops
- * The leaf-tensor-input-gathering logic below (param_entries / add_leaf_if_new) was already fully
- * generic before this change and is unmodified in spirit -- it's folded into the same single walk
- * of the composite body's bindings so the body is only traversed once.
+ * The DNNL serializer converts Relax composite functions into JSON graph nodes
+ * that can be consumed by the DNNL runtime.
+ *
+ * A composite function may contain one or more primitive Relax operator calls,
+ * representing either a single operation or a fused sequence of operations.
+ * The serializer walks the composite body to:
+ *   - collect the leaf tensor inputs of the composite;
+ *   - extract attributes from each primitive operator call;
+ *   - serialize constant scalar and shape arguments as node attributes;
+ *   - record the primitive operation sequence in the "fused_ops" attribute.
+ *
+ * All primitive calls in a composite are represented by a single JSON kernel
+ * node. The serializer does not depend on specific composite names or
+ * hardcoded fused patterns, allowing new composite patterns to be handled
+ * without changes to the codegen logic.
  */
+
 #include <tvm/ffi/cast.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/module.h>

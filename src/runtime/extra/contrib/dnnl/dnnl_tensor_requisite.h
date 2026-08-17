@@ -203,28 +203,6 @@ class TensorRequisite {
     auto orig = std::make_shared<TensorRequisite>(*this);
     // reinterpret memory buffer with new strides
     auto desc = t_desc_.submemory_desc(shape, offset, /*allow_empty=*/true);
-
-    // Originally DNNL implementation is very limited. Let's slightly enhance it.
-    // if (!desc && t_desc_.get_format_kind() == dnnl::memory::format_kind::blocked) {
-    //   bool offset_is_zero =
-    //       std::all_of(offset.begin(), offset.end(), [](auto el) { return el == 0; });
-
-    //   dnnl::memory::dims block_sizes(t_desc_.get_dims().size(), 1);
-    //   for (int i = 0; i < t_desc_.get_inner_nblks(); i++)
-    //     block_sizes[t_desc_.get_inner_idxs()[i]] *= t_desc_.get_inner_blks()[i];
-
-    //   bool shape_reduction_less_than_block = true;
-    //   for (int i = 0; i < t_desc_.get_ndims(); i++) {
-    //     shape_reduction_less_than_block &= t_desc_.get_dims()[i] - shape[i] < block_sizes[i];
-    //   }
-
-    //   // This is auto padded case. Just update dims value.
-    //   if (offset_is_zero && shape_reduction_less_than_block) {
-    //     desc = t_desc_;
-    //     std::copy(shape.begin(), shape.end(), desc.data.dims);
-    //   }
-    // }
-
     TVM_FFI_ICHECK(desc);
 
     return {desc, orig, true, {}, kUndefinedTid, reverse_data_flow_};
@@ -330,6 +308,41 @@ class TensorRequisite {
   }
 
   /*!
+   * \brief Reshape a weight TR into oneDNN's group-major shape {G, O/G, I/G, spatial...}.
+   *
+   * `full_axis` is the LOGICAL axis (0=O, 1=I) currently holding the *undivided* channel count:
+   * regular conv stores it at axis 0 (O), transposed conv at axis 1 (I) -- see call sites.
+   *
+   * First materializes a genuinely dense buffer in the current logical order. TreatAs() can
+   * report logical dims (O,I,spatial...) that don't match physical storage order (e.g. deconv's
+   * default "IOHW" keeps I physically outermost) -- Reshape()/Permute() are only representable
+   * as zero-copy stride reinterpretation once physical and logical order agree.
+   */
+  static TensorRequisite ApplyGroupWeightLayout(TensorRequisite wgh_tr, int groups, int full_axis) {
+    auto dims = wgh_tr.dims();
+    dnnl::memory::dims dense_strides(dims.size());
+    dnnl::memory::dim stride = 1;
+    for (int i = static_cast<int>(dims.size()) - 1; i >= 0; --i) {
+      dense_strides[i] = stride;
+      stride *= dims[i];
+    }
+    wgh_tr = wgh_tr.RequestLayout(dnnl::memory::desc(dims, wgh_tr.data_type(), dense_strides));
+
+    auto w_dims = wgh_tr.dims();
+    w_dims[full_axis] /= groups;
+    w_dims.insert(w_dims.begin() + full_axis, groups);
+    wgh_tr = wgh_tr.Reshape(w_dims);  // valid: splitting in place on a now-dense buffer
+
+    if (full_axis != 0) {
+      std::vector<int> perm(w_dims.size());
+      for (size_t i = 0; i < perm.size(); i++) perm[i] = static_cast<int>(i);
+      std::swap(perm[0], perm[full_axis]);  // move the new `groups` axis to the front
+      wgh_tr = wgh_tr.Permute(perm);
+    }
+    return wgh_tr;
+  }
+
+  /*!
    * \brief Treat TR shape as described in layout string.
    *
    * Blocked dimensions will be concatenated and put into proper shape position corresponding to  .
@@ -421,6 +434,7 @@ class TensorRequisite {
    * Cannot be registered in TensorRegistry. Only for querying DNNL for preferred layouts.
    */
   TensorRequisite LayoutAny() const {
+    if (!defined()) return *this;  // nothing for empty TR -- keep it a proper "no operand" TR
     auto orig = std::make_shared<TensorRequisite>(*this);
     // Recreate tensor desc with layout 'any'
     dnnl::memory::desc any_desc{t_desc_.get_dims(), t_desc_.get_data_type(),

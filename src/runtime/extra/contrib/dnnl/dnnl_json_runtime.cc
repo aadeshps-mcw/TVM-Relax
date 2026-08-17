@@ -156,7 +156,8 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
       // {"gelu_erf", dnnl::algorithm::eltwise_gelu_erf},
   };
 
-  dnnl::primitive_attr ParseAttrs(const size_t& nid, TensorRequisite* bias_tr) {
+  dnnl::primitive_attr ParseAttrs(const size_t& nid, TensorRequisite* bias_tr,
+                                  TensorRequisite* o_scl_tr_out) {
     dnnl::primitive_attr attr;
 
     // Post op attributes based on named inputs.
@@ -168,6 +169,7 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
       TVM_FFI_ICHECK(o_scl_tr.IsConstant());
       auto data = o_scl_tr.GetConstDataLikeVec<float>();
       attr.set_scales_mask(DNNL_ARG_DST, data.size() == 1 ? 0 : (1 << 1));
+      *o_scl_tr_out = o_scl_tr;
     }
 
     auto activation = GetNodeAttr<std::vector<std::string>>(nodes_[nid], "activation", {"none"});
@@ -259,10 +261,10 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
           Deconvolution(nid);
         } else if (contains_any(op_name, "conv1d", "conv2d", "conv3d")) {
           Convolution(nid);
+        } else if (contains(op_name, "dense")) {
+          Dense(nid);
         }
-        // else if (contains(op_name, "dense")) {
-        //   Dense(nid);
-        // } else if ("nn.batch_norm" == op_name) {
+        //  else if ("nn.batch_norm" == op_name) {
         //   BatchNorm(nid);
         // }
         else if (contains_any(op_name, "max_pool1d", "max_pool2d", "max_pool3d")) {
@@ -302,8 +304,9 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     auto wgh_tr = GetInput(nid, 1);
     auto dst_tr = GetOutput(nid, 0);
     auto bias_tr = TensorRequisite{};
+    TensorRequisite o_scl_tr;
 
-    auto attr = ParseAttrs(nid, &bias_tr);
+    auto attr = ParseAttrs(nid, &bias_tr, &o_scl_tr);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
     auto strides = GetNodeAttr<std::vector<int64_t>>(node, "strides");
@@ -381,7 +384,8 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
             {DNNL_ARG_WEIGHTS, wgh_tr},
             {DNNL_ARG_BIAS, bias_tr},
             {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
-            {DNNL_ARG_DST, dst_tr}},
+            {DNNL_ARG_DST, dst_tr},
+            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, o_scl_tr}},
            {sum_in_tr, DNNL_ARG_DST});
   }
 
@@ -393,8 +397,9 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     auto wgh_tr = GetInput(nid, 1);
     auto dst_tr = GetOutput(nid, 0);
     auto bias_tr = TensorRequisite{};
+    TensorRequisite o_scl_tr;
 
-    auto attr = ParseAttrs(nid, &bias_tr);
+    auto attr = ParseAttrs(nid, &bias_tr, &o_scl_tr);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
     auto strides = GetNodeAttr<std::vector<int64_t>>(node, "strides");
@@ -435,11 +440,13 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
 
     auto scratchpad_tr = TensorRequisite::AsIs(deconv_prim_desc.scratchpad_desc());
 
-    Submit(dnnl::deconvolution_forward(deconv_prim_desc), {{DNNL_ARG_SRC, src_tr},
-                                                           {DNNL_ARG_WEIGHTS, wgh_tr},
-                                                           {DNNL_ARG_BIAS, bias_tr},
-                                                           {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
-                                                           {DNNL_ARG_DST, dst_tr}});
+    Submit(dnnl::deconvolution_forward(deconv_prim_desc),
+           {{DNNL_ARG_SRC, src_tr},
+            {DNNL_ARG_WEIGHTS, wgh_tr},
+            {DNNL_ARG_BIAS, bias_tr},
+            {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
+            {DNNL_ARG_DST, dst_tr},
+            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, o_scl_tr}});
   }
 
   void Dense(const size_t& nid) {
@@ -451,8 +458,9 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     auto wgh_tr = GetInput(nid, 1);
     auto dst_tr = GetOutput(nid, 0);
     auto bias_tr = TensorRequisite{};
+    TensorRequisite o_scl_tr;
 
-    auto attr = ParseAttrs(nid, &bias_tr);
+    auto attr = ParseAttrs(nid, &bias_tr, &o_scl_tr);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
     // Assumption that bias is correct and can be squeezed to 1D
@@ -481,7 +489,8 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
             {DNNL_ARG_WEIGHTS, wgh_tr},
             {DNNL_ARG_BIAS, bias_tr},
             {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
-            {DNNL_ARG_DST, dst_tr}},
+            {DNNL_ARG_DST, dst_tr},
+            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, o_scl_tr}},
            {sum_in_tr, DNNL_ARG_DST});
   }
 

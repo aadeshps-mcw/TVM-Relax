@@ -461,7 +461,9 @@ def test_dnnl_prune_removes_empty_compute_subgraph():
 
     pruned = prune_dnnl_subgraphs(mod)
     assert not any(
-        isinstance(func, relax.Function) and func.attrs is not None and func.attrs.get("Codegen") == "dnnl"
+        isinstance(func, relax.Function)
+        and func.attrs is not None
+        and func.attrs.get("Codegen") == "dnnl"
         for func in pruned.functions.values()
     )
 

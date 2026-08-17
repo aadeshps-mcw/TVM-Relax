@@ -21,22 +21,15 @@ Scope note (post cross-check against TVM 0.19's Relay DNNL pattern table):
 this file covers bare ops, bias+activation fusion, and conv2d/matmul bias+sum(+relu) residual
 fusion -- the parts of the legacy Relay pattern table that could be verified against this
 codebase's actual Relax dpl API. NOT ported, deliberately, pending separate verification:
-  - QNN/int8 quantized fusion patterns (qnn.conv2d/qnn.dense + requantize + sum): the BASE case
-    (bare quantized conv2d/dense -- no bias, no activation, no residual-sum) is now covered by
-    make_qnn_conv2d_pattern() / make_qnn_dense_pattern() below, registered as dnnl.qnn.conv2d /
-    dnnl.qnn.matmul. These deliberately mirror the "run the op in float, fold the output-side
-    affine rescale into DNNL's o_scl/dst_zp post-op" design (see ParseAttrs in
-    dnnl_json_runtime.cc) so the two composite names stay drop-in-compatible with whatever
-    equivalent patterns land from a parallel branch -- do not rename dnnl.qnn.conv2d /
-    dnnl.qnn.matmul without checking for a collision there first.
-    Bias/activation/residual-sum fusion ON TOP of the quantized form is still NOT ported at the
-    PATTERN-MATCHING level -- same caveat as the bias+activation loop above, now applying to the
-    quantized variants too. legalize_qnn_op_for_dnnl() below DOES legalize the general
-    "qnn.conv2d/qnn.dense + bias + requantize" chain (weight/bias constant-folding, requantize
-    rewritten to an equivalent dequantize) ahead of pattern matching -- but without a registered
-    dnnl.qnn.conv2d_bias-style pattern, a biased chain still only gets PARTIALLY fused (conv+bias
-    as one dnnl.conv2d_bias/dnnl.matmul_bias composite, rescale left unfused right after it).
-    See legalize_qnn_op_for_dnnl()'s own docstring for the fusion-boundary detail.
+  - QNN/int8 (qnn.conv2d/qnn.dense + requantize [+ sum]):
+  - Base case (bare quantized conv2d/dense, no bias/activation/sum) IS covered --
+    see make_qnn_conv2d_pattern()/make_qnn_dense_pattern() -> dnnl.qnn.conv2d / dnnl.qnn.matmul.
+    Keep these two composite names stable; check for collisions before renaming.
+  - legalize_qnn_op_for_dnnl() legalizes "qnn.conv2d/qnn.dense + bias + requantize" ahead of
+    pattern matching, but since there's no dnnl.qnn.conv2d_bias-style pattern registered yet,
+    a biased chain only gets PARTIALLY fused (conv+bias as one composite, rescale left
+    unfused after it). Bias/activation/residual-sum fusion on TOP of quantized ops is NOT
+    ported at the pattern-matching level -- see legalize_qnn_op_for_dnnl()'s docstring.
   - swish/mish/gelu as decomposed multi-op activation patterns -- the legacy Relay version builds
     these from primitive ops (e.g. swish = sigmoid -> multiply) because Relay had no fused op for
     them; whether Relax's make_fused_bias_activation_pattern needs the same treatment or already
@@ -133,7 +126,7 @@ def _fused_patterns() -> list[Pattern]:
     return patterns
 
 
-# Bias + residual-sum (+ activation) fusion. Ported from TVM 0.19's Relay
+# Bias + residual-sum (+ activation) fusion.
 # make_conv_bias_sum_relu_pattern / make_dense_bias_sum_pattern, matched 1:1 in scope (conv2d gets
 # both the relu and no-relu sum variant; matmul gets only the no-relu sum variant, exactly as the
 # legacy pattern table registers it -- not generalized beyond what was actually validated upstream).
@@ -227,7 +220,8 @@ def _reject_int64_like(*exprs) -> bool:
 
 
 def _is_scalar_or_size1_const(expr) -> bool:
-    """True if `expr`'s shape is 0-d, or 1-d with exactly one element. only scalar (per-tensor) output rescale is accepted."""
+    """True if `expr`'s shape is 0-d, or 1-d with exactly one element.
+    only scalar (per-tensor) output rescale is accepted."""
     ty = getattr(expr, "ty", None)
     shape = getattr(ty, "shape", None)
     if shape is None:
@@ -350,94 +344,6 @@ _CONV_LAYOUT_QUERY_SPECS: dict[str, tuple[int, bool, list[str]]] = {
 }
 
 
-def _query_one_conv2d_layout(query_fn, call: relax.Call) -> list[str] | None:
-    """Extract shape/attrs from a single ungrouped conv2d call and query oneDNN for its
-    preferred layout via the minimal 7-arg FFI function. Returns None (caller falls back to the
-    hardcoded default) on any non-static shape, missing type info, a blocked-format rejection,
-    or an oneDNN/argument-marshalling failure -- all legitimate "can't answer" outcomes, not bugs.
-    """
-    src_ty = call.args[0].ty
-    wgh_ty = call.args[1].ty
-    if src_ty is None or wgh_ty is None:
-        return None
-
-    src_shape = src_ty.shape
-    wgh_shape = wgh_ty.shape
-    if src_shape is None or wgh_shape is None:
-        return None
-
-    if not (
-        all(isinstance(d, tvm.tirx.IntImm) for d in src_shape.values)
-        and all(isinstance(d, tvm.tirx.IntImm) for d in wgh_shape.values)
-    ):
-        return None
-
-    src_vals = [int(d) for d in src_shape.values]
-    wgh_vals = [int(d) for d in wgh_shape.values]
-    if len(src_vals) != 4 or len(wgh_vals) != 4:
-        return None
-
-    attrs = call.attrs
-
-    try:
-        src_layout, wgh_layout = query_fn(
-            src_vals,
-            wgh_vals,
-            [int(v) for v in attrs.strides],
-            [int(v) for v in attrs.dilation],
-            [int(v) for v in attrs.padding],
-            int(attrs.groups),
-            str(src_ty.dtype),
-        )
-        src_layout, wgh_layout = str(src_layout), str(wgh_layout)
-    except (tvm.error.TVMError, TypeError, ValueError):
-        # TypeError/ValueError guard against a future arg-count/type drift between this Python
-        # call site and the C++ signature failing loudly across the whole partition pass instead
-        # of degrading to "use the plain default", same spirit as the TVMError case.
-        return None
-
-    is_blocked = any(c.isdigit() for c in src_layout + wgh_layout)
-    if is_blocked:
-        return None
-
-    return [src_layout, wgh_layout]
-
-
-def _query_dnnl_conv_layouts(mod: tvm.IRModule) -> dict[str, list[str]]:
-    """Ask oneDNN what layout it would choose for each offloadable conv op's activation/weight
-    tensors -- conv1d/2d/3d and their transposed forms -- using one representative call per op
-    found in the module, instead of hardcoding plain NCHW/OIHW-style defaults for everything but
-    conv2d. Single module traversal, table-driven via _CONV_LAYOUT_QUERY_SPECS above."""
-    query_fn = tvm.get_global_func(
-        "runtime.contrib.dnnl.query_optimal_conv2d_layout", allow_missing=True
-    )
-    if query_fn is None:
-        return {}
-
-    found: dict[str, list[str]] = {}
-
-    @visitor
-    class _FirstConv2dFinder(relax.PyExprVisitor):
-        def visit_call_(self, call: relax.Call):
-            if (
-                "relax.nn.conv2d" not in found
-                and isinstance(call.op, tvm.ir.Op)
-                and call.op.name == "relax.nn.conv2d"
-            ):
-                layout = _query_one_conv2d_layout(query_fn, call)
-                if layout is not None:
-                    found["relax.nn.conv2d"] = layout
-            super().visit_call_(call)
-
-    for gvar, func in mod.functions.items():
-        if isinstance(func, relax.Function):
-            _FirstConv2dFinder().visit_expr(func)
-            if "relax.nn.conv2d" in found:
-                break
-
-    return found
-
-
 def _try_fold_qdq_constant(q_expr, scale_expr, zp_expr) -> np.ndarray | None:
     """If q/scale/zp are all compile-time relax.Constant and scale/zp are per-tensor (size 1),
     return the dequantized float32 numpy array; else None -- caller must leave the chain alone,
@@ -454,7 +360,6 @@ def _try_fold_qdq_constant(q_expr, scale_expr, zp_expr) -> np.ndarray | None:
     scale_np = scale_expr.data.numpy().astype("float32")
     zp_np = zp_expr.data.numpy().astype("float32")
 
-    # Base scope: per-tensor quantization only (matches the restriction this function already had for weight-folding).
     if scale_np.size != 1 or zp_np.size != 1:
         return None
 
@@ -618,9 +523,8 @@ def partition_for_dnnl(
         mod = pre_seq(mod)
 
     if alter_layout:
-        queried_layouts = _query_dnnl_conv_layouts(mod)
         desired_layouts = {
-            op_name: queried_layouts.get(op_name, default_layout)
+            op_name: default_layout
             for op_name, (_rank, is_transpose, default_layout) in _CONV_LAYOUT_QUERY_SPECS.items()
             if not is_transpose
         }
@@ -774,7 +678,8 @@ def rewrite_pad_avg_pool2d(mod: tvm.IRModule) -> tvm.IRModule:
                 return expr
 
             # 4) pad must have a single consumer (this pool call).
-            if use_count.get(id(matches[pad_pat]), 0) > 1:
+            padded_arg = pool_call.args[0]
+            if not isinstance(padded_arg, relax.Var) or use_count.get(id(padded_arg), 0) > 1:
                 return expr
 
             merged_padding = [h_before, w_before, h_after, w_after]  # (top, left, bottom, right)

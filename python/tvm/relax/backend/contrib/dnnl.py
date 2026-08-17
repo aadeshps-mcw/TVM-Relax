@@ -36,8 +36,6 @@ from tvm.relax.transform import (
 
 from ..pattern_registry import Pattern, register_patterns
 
-# --- ADD THESE JUST AFTER THE IMPORTS ---
-
 SUPPORTED_ELTWISE = {
     "abs",
     "exp",
@@ -46,8 +44,8 @@ SUPPORTED_ELTWISE = {
     "round",
     "relu",
     "nn.relu",
-    "leaky_relu",
-    "nn.leaky_relu",
+    "leakyrelu",
+    "nn.leakyrelu",
     "tanh",
     "sigmoid",
     "clip",
@@ -415,7 +413,12 @@ def rewrite_resnet_downsample(func: relax.Function) -> relax.Function:
             matches[weight_1x1],
             strides=(1, 1),
             padding=matched_conv1.attrs.padding,
+            dilation=matched_conv1.attrs.dilation,
             groups=matched_conv1.attrs.groups,
+            data_layout=matched_conv1.attrs.data_layout,
+            kernel_layout=matched_conv1.attrs.kernel_layout,
+            out_layout=matched_conv1.attrs.out_layout,
+            out_dtype=matched_conv1.attrs.out_dtype,
         )
         new_relu = relax.op.nn.relu(new_conv1)
         new_conv2 = relax.op.nn.conv2d(
@@ -423,7 +426,12 @@ def rewrite_resnet_downsample(func: relax.Function) -> relax.Function:
             matches[weight_3x3],
             strides=(2, 2),
             padding=matched_conv2.attrs.padding,
+            dilation=matched_conv2.attrs.dilation,
             groups=matched_conv2.attrs.groups,
+            data_layout=matched_conv2.attrs.data_layout,
+            kernel_layout=matched_conv2.attrs.kernel_layout,
+            out_layout=matched_conv2.attrs.out_layout,
+            out_dtype=matched_conv2.attrs.out_dtype,
         )
         return new_conv2
 
@@ -552,10 +560,10 @@ def _count_compute_ops(mod: tvm.IRModule, func: relax.Function) -> int:
             if isinstance(call.op, tvm.ir.Op) and call.op.name in _DNNL_COMPUTE_OPS:
                 count += 1
             elif isinstance(call.op, relax.GlobalVar):
-                name = call.op.name_hint
-                if name not in seen_globals and name in mod.global_var_map_:
-                    seen_globals.add(name)
-                    self.visit_expr(mod[name])
+                gv = call.op
+                if gv not in seen_globals and gv in mod.functions:
+                    seen_globals.add(gv)
+                    self.visit_expr(mod[gv])
             super().visit_call_(call)
 
     _Counter().visit_expr(func)

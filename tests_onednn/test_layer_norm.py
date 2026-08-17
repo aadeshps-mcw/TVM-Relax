@@ -16,10 +16,18 @@
 # under the License.
 
 import numpy as np
+import pytest
 
 import tvm
 from tvm import relax
 from tvm.relax.backend.contrib.dnnl import partition_for_dnnl
+
+_requires_dnnl = (
+    tvm.get_global_func("runtime.DNNLJSONRuntimeCreate", allow_missing=True) is not None
+)
+pytestmark = pytest.mark.skipif(
+    not _requires_dnnl, reason="DNNL JSON runtime not registered in this build"
+)
 
 
 def test_matmul():
@@ -54,4 +62,5 @@ def test_matmul():
     print("matmul OK")
 
 
-test_matmul()
+if __name__ == "__main__":
+    test_matmul()

@@ -43,10 +43,14 @@
 //  -Wzero-as-null-pointer-constant and -Wdocumentation-unknown-command
 #include <dnnl.hpp>
 // Public introspection API (dnnl_fmt_tag2str, dnnl_format_tag_last) used by TreatAs() to build
-// a complete format_tag lookup table without hand-maintaining one. If this header is not found
-// at this path in your oneDNN install, try "oneapi/dnnl/dnnl_debug.h" instead -- it is shipped
-// alongside dnnl.hpp either way.
+// a complete format_tag lookup table without hand-maintaining one.
+#if __has_include(<dnnl_debug.h>)
 #include <dnnl_debug.h>
+#elif __has_include(<oneapi/dnnl/dnnl_debug.h>)
+#include <oneapi/dnnl/dnnl_debug.h>
+#else
+#error "oneDNN debug header not found: expected dnnl_debug.h"
+#endif
 
 #include "dnnl_utils.h"
 

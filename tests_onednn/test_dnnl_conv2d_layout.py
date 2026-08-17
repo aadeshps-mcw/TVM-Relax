@@ -558,6 +558,42 @@ DTYPE_CASES = [
 ]
 
 
+def _cpu_isa_flags():
+    """Returns the set of CPU ISA feature flags (lowercase) reported by the
+    kernel, or an empty set if they can't be read (non-Linux, sandboxed,
+    etc.) -- in which case ISA-gated dtypes are conservatively skipped."""
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith(("flags", "Features")):
+                    return set(line.strip().split(":", 1)[1].split())
+    except OSError:
+        pass
+    return set()
+
+
+_CPU_ISA_FLAGS = _cpu_isa_flags()
+
+
+def _dtype_requires_unavailable_isa(dtype):
+    """oneDNN can only create a convolution primitive for f16/bf16 if the
+    CPU exposes the matching ISA extension -- AVX512_FP16 for f16;
+    AVX512_BF16 or AMX_BF16 for bf16. Without it, primitive-desc creation
+    fails outright (tvm.error.InternalError: could not create a primitive
+    descriptor for the convolution forward propagation primitive) rather
+    than falling back to a slower reference path. int8/uint8/float32 are
+    supported on essentially all x86_64 CPUs and are never gated here.
+
+    Returns a human-readable skip reason if `dtype` needs ISA support this
+    CPU lacks, else None.
+    """
+    if dtype == "float16" and "avx512_fp16" not in _CPU_ISA_FLAGS:
+        return "float16 conv2d requires AVX512_FP16, which this CPU doesn't expose"
+    if dtype == "bfloat16" and not ({"avx512_bf16", "amx_bf16"} & _CPU_ISA_FLAGS):
+        return "bfloat16 conv2d requires AVX512_BF16 or AMX_BF16, which this CPU doesn't expose"
+    return None
+
+
 def _random_for_dtype(shape, dtype):
     if dtype in ("float32", "float16"):
         return np.random.uniform(-1, 1, size=shape).astype(dtype)
@@ -576,6 +612,10 @@ def _random_for_dtype(shape, dtype):
 
 @pytest.mark.parametrize("dtype,weight_dtype,out_dtype", DTYPE_CASES)
 def test_conv2d_crop_treatas_dtype_variants(dtype, weight_dtype, out_dtype):
+    skip_reason = _dtype_requires_unavailable_isa(dtype)
+    if skip_reason:
+        pytest.skip(skip_reason)
+
     np.random.seed(10)
     data_shape = (1, 16, 16, 16)
     mod, weight_shape = _make_conv2d_module(
@@ -589,6 +629,131 @@ def test_conv2d_crop_treatas_dtype_variants(dtype, weight_dtype, out_dtype):
     data_np = _random_for_dtype(data_shape, dtype)
     weight_np = _random_for_dtype(weight_shape, weight_dtype)  # <-- was `dtype`, now `weight_dtype`
     _compile_and_compare(mod, [data_np, weight_np], alter_layout=True, rtol=1e-2, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# int8/uint8 vs. independent numpy ground truth
+# ---------------------------------------------------------------------------
+# Crop()/TreatAs() are ruled out as the cause of the int8/uint8 mismatch
+# surfaced by test_conv2d_crop_treatas_dtype_variants above: groups=1 fails
+# just as badly as groups=4 (i.e. disabling Crop() entirely by not using
+# groups doesn't fix it), and alter_layout=True vs. False -- which is what
+# drives whether TreatAs() gets exercised at all -- produce byte-identical
+# mismatches. Since neither knob changes the outcome, the bug must be in the
+# int8 convolution computation itself: on the DNNL side, the plain-TVM
+# reference side, or both.
+#
+# `_compile_and_compare` above only checks the DNNL and plain-TVM outputs
+# against *each other* -- it can't tell us which one (if either) is actually
+# right when they disagree. This adds a from-scratch numpy reference,
+# computed independently of both TVM code paths, as a tiebreaker. Kept to
+# groups=1 (groups is already cleared as a suspect via the Crop() coverage
+# above, and a groups=1 reference is simpler to get right by hand) and to
+# int8/uint8 specifically, since that's the dtype pairing under active
+# investigation.
+
+
+def _numpy_conv2d_s32(data, weight, padding, stride=1):
+    """Independent reference: explicit int64 accumulation (to avoid any
+    accidental overflow obscuring the comparison), no groups (groups=1
+    only -- keep this minimal since groups is already cleared as a
+    suspect). Treats `data`/`weight` as literal integer values per their
+    numpy dtype (i.e. u8 is genuinely 0..255, s8 is genuinely -128..127;
+    no implicit zero-point/offset is applied anywhere)."""
+    n, c, h, w = data.shape
+    oc, ic, kh, kw = weight.shape
+    assert ic == c, "this helper assumes groups=1"
+
+    data_i = data.astype(np.int64)
+    weight_i = weight.astype(np.int64)
+    data_p = np.pad(data_i, ((0, 0), (0, 0), (padding, padding), (padding, padding)))
+
+    oh = (h + 2 * padding - kh) // stride + 1
+    ow = (w + 2 * padding - kw) // stride + 1
+    out = np.zeros((n, oc, oh, ow), dtype=np.int64)
+
+    for o in range(oc):
+        for y in range(oh):
+            for x in range(ow):
+                patch = data_p[:, :, y * stride : y * stride + kh, x * stride : x * stride + kw]
+                out[:, o, y, x] = np.sum(patch * weight_i[o], axis=(1, 2, 3))
+
+    return out.astype(np.int32)
+
+
+def _get_dnnl_and_ref_outputs(mod, data_np, weight_np, alter_layout=False):
+    """Same two computations _compile_and_compare does, but returns both
+    instead of just asserting they match each other."""
+    target = tvm.target.Target("llvm")
+    tvm_args = [tvm.runtime.tensor(data_np), tvm.runtime.tensor(weight_np)]
+
+    ref_ex = relax.build(mod, target=target)
+    ref_vm = relax.VirtualMachine(ref_ex, tvm.cpu())
+    plain_tvm_out = ref_vm["main"](*tvm_args).numpy()
+
+    partitioned = partition_for_dnnl(mod, alter_layout=alter_layout, run_codegen=False)
+    with tvm.transform.PassContext(opt_level=3):
+        codegen_mod = relax.transform.RunCodegen(target_options={"dnnl": {}})(partitioned)
+    ex = relax.build(codegen_mod, target=target)
+    vm = relax.VirtualMachine(ex, tvm.cpu())
+    dnnl_out = vm["main"](*tvm_args).numpy()
+
+    return dnnl_out, plain_tvm_out
+
+
+@pytest.mark.parametrize(
+    "dtype,weight_dtype",
+    [
+        ("int8", "int8"),
+        ("uint8", "int8"),
+    ],
+)
+def test_int8_conv_against_independent_ground_truth(dtype, weight_dtype):
+    np.random.seed(42)
+    data_shape = (1, 4, 5, 5)
+    out_channels = 4
+
+    mod, weight_shape = _make_conv2d_module(
+        data_shape=data_shape,
+        out_channels=out_channels,
+        groups=1,
+        kernel_size=(3, 3),
+        padding=(1, 1),
+        dtype=dtype,
+        weight_dtype=weight_dtype,
+        out_dtype="int32",
+    )
+    data_np = _random_for_dtype(data_shape, dtype)
+    weight_np = _random_for_dtype(weight_shape, weight_dtype)
+
+    dnnl_out, plain_tvm_out = _get_dnnl_and_ref_outputs(mod, data_np, weight_np, alter_layout=False)
+    ground_truth = _numpy_conv2d_s32(data_np, weight_np, padding=1, stride=1)
+
+    dnnl_matches_gt = np.array_equal(dnnl_out, ground_truth)
+    tvm_matches_gt = np.array_equal(plain_tvm_out, ground_truth)
+
+    print(f"\n[{dtype}] DNNL matches independent ground truth:      {dnnl_matches_gt}")
+    print(f"[{dtype}] plain-TVM matches independent ground truth:  {tvm_matches_gt}")
+
+    if not dnnl_matches_gt:
+        diff = dnnl_out.astype(np.int64) - ground_truth.astype(np.int64)
+        print(
+            f"[{dtype}] DNNL vs ground truth: mismatched={np.count_nonzero(diff)}/{diff.size}, "
+            f"max_abs_diff={np.max(np.abs(diff))}"
+        )
+    if not tvm_matches_gt:
+        diff = plain_tvm_out.astype(np.int64) - ground_truth.astype(np.int64)
+        print(
+            f"[{dtype}] plain-TVM vs ground truth: "
+            f"mismatched={np.count_nonzero(diff)}/{diff.size}, "
+            f"max_abs_diff={np.max(np.abs(diff))}"
+        )
+
+    # Don't assert yet -- this test is diagnostic. Both prints above tell
+    # us which backend (if either) is actually correct. Uncomment once
+    # you know which side should be trusted:
+    # assert dnnl_matches_gt, "DNNL path diverges from independent ground truth"
+    # assert tvm_matches_gt, "plain-TVM path diverges from independent ground truth"
 
 
 if __name__ == "__main__":

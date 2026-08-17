@@ -110,15 +110,25 @@ class DNNLJSONSerializer : public JSONSerializer {
 
     NodeEntries inputs;
     std::unordered_set<const ffi::Object*> seen;
+    std::unordered_map<const VarNode*, Expr> local_bindings;
 
     auto add_leaf_if_new = [&](const Expr& e) {
       const ffi::Object* key = e.get();
       if (seen.count(key)) return;
       if (const auto* var_node = e.as<VarNode>()) {
-        auto it = param_entries.find(var_node);
-        if (it == param_entries.end()) return;  // internal binding var, not a leaf
-        seen.insert(key);
-        inputs.insert(inputs.end(), it->second.begin(), it->second.end());
+        if (auto it = param_entries.find(var_node); it != param_entries.end()) {
+          seen.insert(key);
+          inputs.insert(inputs.end(), it->second.begin(), it->second.end());
+          return;
+        }
+        // Not an external param -- may be an internal var bound to a constant.
+        if (auto lb_it = local_bindings.find(var_node);
+            lb_it != local_bindings.end() && lb_it->second.as<ConstantNode>()) {
+          seen.insert(key);
+          auto res = VisitExpr(lb_it->second);
+          inputs.insert(inputs.end(), res.begin(), res.end());
+        }
+        // else: bound to a non-constant (e.g. another call's result) -- genuinely not a leaf
       } else if (e.as<ConstantNode>()) {
         seen.insert(key);
         auto res = VisitExpr(e);
@@ -132,6 +142,7 @@ class DNNLJSONSerializer : public JSONSerializer {
       for (const auto& binding : block->bindings) {
         const auto* var_binding = binding.as<VarBindingNode>();
         TVM_FFI_ICHECK(var_binding) << "Expected VarBinding inside composite function.";
+        local_bindings[var_binding->var.get()] = var_binding->value;
         if (const auto* inner_call = var_binding->value.as<CallNode>()) {
           for (const auto& arg : inner_call->args) {
             add_leaf_if_new(arg);

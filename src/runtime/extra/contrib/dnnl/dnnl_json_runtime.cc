@@ -153,10 +153,10 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
       {"gelu_erf", dnnl::algorithm::eltwise_gelu_erf},
   };
 
-  dnnl::primitive_attr ParseAttrs(const size_t& nid, TensorRequisite* bias_tr) {
+  dnnl::primitive_attr ParseAttrs(const size_t& nid, TensorRequisite* bias_tr,
+                                  TensorRequisite* o_scl_tr_out) {
     dnnl::primitive_attr attr;
 
-    // Post op attributes based on named inputs.
     auto dst_zp_tr = GetInputByName(nid, "dst_zp_idx");
     auto o_scl_tr = GetInputByName(nid, "o_scl_idx");
     auto sum_scl_tr = GetInputByName(nid, "sum_scl_idx");
@@ -165,6 +165,7 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
       TVM_FFI_ICHECK(o_scl_tr.IsConstant());
       auto data = o_scl_tr.GetConstDataLikeVec<float>();
       attr.set_scales_mask(DNNL_ARG_DST, data.size() == 1 ? 0 : (1 << 1));
+      *o_scl_tr_out = o_scl_tr;
     }
 
     auto activation = GetNodeAttr<std::vector<std::string>>(nodes_[nid], "activation", {"none"});
@@ -277,6 +278,8 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
           LayerNorm(nid);
         } else if (contains(op_name, "matmul") && !contains(op_name, "batch_matmul")) {
           MatMul(nid);
+        } else if ("nn.batch_matmul" == op_name) {
+          BatchMatMul(nid);
         } else {
           TVM_FFI_THROW(InternalError) << "Unsupported op: " << op_name;
         }
@@ -293,6 +296,8 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     auto wgh_tr = GetInput(nid, 1);
     auto dst_tr = GetOutput(nid, 0);
     auto bias_tr = TensorRequisite{};
+    auto o_scl_tr = TensorRequisite{};
+    auto attr = ParseAttrs(nid, &bias_tr, &o_scl_tr);
 
     auto attr = ParseAttrs(nid, &bias_tr);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
@@ -375,6 +380,7 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
             {DNNL_ARG_WEIGHTS, wgh_tr},
             {DNNL_ARG_BIAS, bias_tr},
             {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
+            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, o_scl_tr},
             {DNNL_ARG_DST, dst_tr}},
            {sum_in_tr, DNNL_ARG_DST});
   }
@@ -387,6 +393,8 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     auto wgh_tr = GetInput(nid, 1);
     auto dst_tr = GetOutput(nid, 0);
     auto bias_tr = TensorRequisite{};
+    auto o_scl_tr = TensorRequisite{};
+    auto attr = ParseAttrs(nid, &bias_tr, &o_scl_tr);
 
     auto attr = ParseAttrs(nid, &bias_tr);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
@@ -436,11 +444,13 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
 
     auto scratchpad_tr = TensorRequisite::AsIs(deconv_prim_desc.scratchpad_desc());
 
-    Submit(dnnl::deconvolution_forward(deconv_prim_desc), {{DNNL_ARG_SRC, src_tr},
-                                                           {DNNL_ARG_WEIGHTS, wgh_tr},
-                                                           {DNNL_ARG_BIAS, bias_tr},
-                                                           {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
-                                                           {DNNL_ARG_DST, dst_tr}});
+    Submit(dnnl::deconvolution_forward(deconv_prim_desc),
+           {{DNNL_ARG_SRC, src_tr},
+            {DNNL_ARG_WEIGHTS, wgh_tr},
+            {DNNL_ARG_BIAS, bias_tr},
+            {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
+            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, o_scl_tr},
+            {DNNL_ARG_DST, dst_tr}});
   }
 
   void Dense(const size_t& nid) {
@@ -452,6 +462,8 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     auto wgh_tr = GetInput(nid, 1);
     auto dst_tr = GetOutput(nid, 0);
     auto bias_tr = TensorRequisite{};
+    auto o_scl_tr = TensorRequisite{};
+    auto attr = ParseAttrs(nid, &bias_tr, &o_scl_tr);
 
     auto attr = ParseAttrs(nid, &bias_tr);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
@@ -482,6 +494,7 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
             {DNNL_ARG_WEIGHTS, wgh_tr},
             {DNNL_ARG_BIAS, bias_tr},
             {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
+            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, o_scl_tr},
             {DNNL_ARG_DST, dst_tr}},
            {sum_in_tr, DNNL_ARG_DST});
   }
@@ -491,22 +504,30 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     auto wgh_tr = GetInput(nid, 1);
     auto dst_tr = GetOutput(nid, 0);
     auto bias_tr = TensorRequisite{};
+    auto o_scl_tr = TensorRequisite{};
+    auto attr = ParseAttrs(nid, &bias_tr, &o_scl_tr);
 
     auto attr = ParseAttrs(nid, &bias_tr);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
+    dnnl::matmul::primitive_desc matmul_prim_desc;
     if (bias_tr.defined()) {
       bias_tr = bias_tr.Reshape({dst_tr.dims().back()});
+      matmul_prim_desc = dnnl::matmul::primitive_desc(
+          engine_, src_tr.LayoutAny().desc(), wgh_tr.LayoutAny().desc(), bias_tr.LayoutAny().desc(),
+          dst_tr.LayoutAny().desc(), attr);
+    } else {
+      matmul_prim_desc =
+          dnnl::matmul::primitive_desc(engine_, src_tr.LayoutAny().desc(),
+                                       wgh_tr.LayoutAny().desc(), dst_tr.LayoutAny().desc(), attr);
     }
-
-    auto matmul_prim_desc =
-        dnnl::matmul::primitive_desc(engine_, src_tr.LayoutAny().desc(), wgh_tr.LayoutAny().desc(),
-                                     bias_tr.LayoutAny().desc(), dst_tr.LayoutAny().desc(), attr);
 
     src_tr = src_tr.RequestLayout(matmul_prim_desc.src_desc());
     wgh_tr = wgh_tr.RequestLayout(matmul_prim_desc.weights_desc());
     dst_tr = dst_tr.RequestLayout(matmul_prim_desc.dst_desc());
-    bias_tr = bias_tr.RequestLayout(matmul_prim_desc.bias_desc());
+    if (bias_tr.defined()) {
+      bias_tr = bias_tr.RequestLayout(matmul_prim_desc.bias_desc());
+    }
 
     auto scratchpad_tr = TensorRequisite::AsIs(matmul_prim_desc.scratchpad_desc());
 
@@ -514,6 +535,7 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
                                             {DNNL_ARG_WEIGHTS, wgh_tr},
                                             {DNNL_ARG_BIAS, bias_tr},
                                             {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
+                                            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, o_scl_tr},
                                             {DNNL_ARG_DST, dst_tr}});
   }
 
@@ -525,6 +547,8 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     auto wgh_tr = GetInput(nid, 1);
     auto dst_tr = GetOutput(nid, 0);
     auto bias_tr = TensorRequisite{};
+    auto o_scl_tr = TensorRequisite{};
+    auto attr = ParseAttrs(nid, &bias_tr, &o_scl_tr);
 
     auto attr = ParseAttrs(nid, &bias_tr);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
@@ -558,6 +582,7 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
                                          {DNNL_ARG_WEIGHTS, wgh_tr},
                                          {DNNL_ARG_BIAS, bias_tr},
                                          {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
+                                         {DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, o_scl_tr},
                                          {DNNL_ARG_DST, dst_tr}});
   }
 
@@ -693,7 +718,6 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     for (auto& d : dilates) d--;
 
     // Attributes related to AvgPool
-    // Replace the if(!is_global) block and descriptors with:
     if (!is_global && (algo == dnnl::algorithm::pooling_avg_exclude_padding ||
                        algo == dnnl::algorithm::pooling_avg_include_padding)) {
       auto include_pad = GetNodeAttr<bool>(node, "count_include_pad");

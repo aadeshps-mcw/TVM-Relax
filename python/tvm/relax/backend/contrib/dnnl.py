@@ -57,6 +57,7 @@ def _op_pattern(composite_name: str, op_name: str, num_args: int) -> Pattern:
     args = [wildcard() for _ in range(num_args)]
     return (composite_name, is_op(op_name)(*args), {})
 
+
 # Bias + activation fusion (generated, not hand-listed -- see _fused_patterns()).
 
 # Ops for which DNNL implements a fused bias-add + activation post-op chain. layer_norm is
@@ -115,7 +116,6 @@ def _fused_patterns() -> list[Pattern]:
     return patterns
 
 
-
 # Bias + residual-sum (+ activation) fusion. Ported from TVM 0.19's Relay
 # make_conv_bias_sum_relu_pattern / make_dense_bias_sum_pattern, matched 1:1 in scope (conv2d gets
 # both the relu and no-relu sum variant; matmul gets only the no-relu sum variant, exactly as the
@@ -123,7 +123,6 @@ def _fused_patterns() -> list[Pattern]:
 # Unlike the bias+activation loop above, this needs its own builder: the residual operand is a
 # second full tensor input, not a scalar/activation choice, so it isn't expressible as another
 # axis of the same loop.
-
 
 
 def _sum_pattern(op_name: str, channel_axis: int, with_relu: bool) -> Pattern:

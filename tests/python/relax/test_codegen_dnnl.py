@@ -28,14 +28,11 @@
 # isolation.
 import numpy as np
 import pytest
-import torch
-import torch.nn as nn
 
 import tvm
 import tvm.testing
 from tvm import relax
 from tvm.relax.backend.contrib.dnnl import partition_for_dnnl
-from tvm.relax.frontend.torch import from_exported_program
 from tvm.script import relax as R
 
 has_dnnl = tvm.get_global_func("relax.ext.dnnl", True)
@@ -46,6 +43,11 @@ requires_dnnl_codegen = pytest.mark.skipif(
 )
 
 pytestmark = [requires_dnnl_codegen]
+
+torch = pytest.importorskip("torch")
+import torch.nn as nn  # noqa: E402
+
+from tvm.relax.frontend.torch import from_exported_program  # noqa: E402
 
 
 def _to_numpy(out):
@@ -89,7 +91,9 @@ def _offload_and_compare(mod, params_np, data_np, alter_layout=True, rtol=1e-4, 
     # reaches the DNNL codegen path and the comparison below would trivially succeed via the TVM
     # fallback without exercising anything.
     assert any(
-        isinstance(fn, relax.Function) and fn.attrs is not None and fn.attrs.get("Codegen") == "dnnl"
+        isinstance(fn, relax.Function)
+        and fn.attrs is not None
+        and fn.attrs.get("Codegen") == "dnnl"
         for fn in partitioned.functions.values()
     ), "expected the op under test to be offloaded to DNNL, but nothing was partitioned"
 
@@ -253,7 +257,8 @@ def test_dnnl_conv3d():
     class Conv3d:
         @R.function
         def main(
-            data: R.Tensor((1, 3, 8, 8, 8), "float32"), weight: R.Tensor((16, 3, 3, 3, 3), "float32")
+            data: R.Tensor((1, 3, 8, 8, 8), "float32"),
+            weight: R.Tensor((16, 3, 3, 3, 3), "float32"),
         ):
             with R.dataflow():
                 out = relax.op.nn.conv3d(data, weight, padding=1)
@@ -270,7 +275,8 @@ def test_dnnl_conv3d_grouped():
     class Conv3dGrouped:
         @R.function
         def main(
-            data: R.Tensor((1, 16, 8, 8, 8), "float32"), weight: R.Tensor((32, 8, 3, 3, 3), "float32")
+            data: R.Tensor((1, 16, 8, 8, 8), "float32"),
+            weight: R.Tensor((32, 8, 3, 3, 3), "float32"),
         ):
             with R.dataflow():
                 out = relax.op.nn.conv3d(data, weight, padding=1, groups=2)
@@ -351,7 +357,8 @@ def test_dnnl_conv3d_transpose():
     class ConvTranspose3d:
         @R.function
         def main(
-            data: R.Tensor((1, 16, 8, 8, 8), "float32"), weight: R.Tensor((16, 8, 3, 3, 3), "float32")
+            data: R.Tensor((1, 16, 8, 8, 8), "float32"),
+            weight: R.Tensor((16, 8, 3, 3, 3), "float32"),
         ):
             with R.dataflow():
                 out = relax.op.nn.conv3d_transpose(data, weight, padding=1)
@@ -368,7 +375,8 @@ def test_dnnl_conv3d_transpose_strided():
     class ConvTranspose3dStrided:
         @R.function
         def main(
-            data: R.Tensor((1, 16, 4, 4, 4), "float32"), weight: R.Tensor((16, 8, 4, 4, 4), "float32")
+            data: R.Tensor((1, 16, 4, 4, 4), "float32"),
+            weight: R.Tensor((16, 8, 4, 4, 4), "float32"),
         ):
             with R.dataflow():
                 out = relax.op.nn.conv3d_transpose(data, weight, strides=2, padding=1)
@@ -399,9 +407,7 @@ def test_partition_for_dnnl_conv2d_stack():
         ):
             with R.dataflow():
                 conv1 = relax.op.nn.relu(relax.op.nn.conv2d(data, weight1, padding=1))
-                conv2 = relax.op.nn.relu(
-                    relax.op.nn.conv2d(conv1, weight2, strides=2, padding=1)
-                )
+                conv2 = relax.op.nn.relu(relax.op.nn.conv2d(conv1, weight2, strides=2, padding=1))
                 R.output(conv2)
             return conv2
 
@@ -413,7 +419,9 @@ def test_partition_for_dnnl_conv2d_stack():
 
     partitioned = partition_for_dnnl(ConvStack, alter_layout=True)
     assert any(
-        isinstance(fn, relax.Function) and fn.attrs is not None and fn.attrs.get("Codegen") == "dnnl"
+        isinstance(fn, relax.Function)
+        and fn.attrs is not None
+        and fn.attrs.get("Codegen") == "dnnl"
         for fn in partitioned.functions.values()
     ), "expected partition_for_dnnl to offload at least one subgraph to DNNL"
 
@@ -600,9 +608,7 @@ def test_dnnl_conv3d_transpose_model_offloaded_and_numerically_correct():
             up_weight: R.Tensor((8, 3, 4, 4, 4), "float32"),
         ):
             with R.dataflow():
-                down = relax.op.nn.relu(
-                    relax.op.nn.conv3d(data, down_weight, strides=2, padding=1)
-                )
+                down = relax.op.nn.relu(relax.op.nn.conv3d(data, down_weight, strides=2, padding=1))
                 up = relax.op.nn.conv3d_transpose(down, up_weight, strides=2, padding=1)
                 R.output(up)
             return up

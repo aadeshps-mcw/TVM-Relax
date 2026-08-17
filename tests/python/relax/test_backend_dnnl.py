@@ -19,9 +19,12 @@ import numpy as np
 import pytest
 
 import tvm
+import tvm.testing
 from tvm import relax
 from tvm.relax.backend.contrib.dnnl import partition_for_dnnl
 
+has_dnnl = tvm.get_global_func("relax.ext.dnnl", True)
+pytestmark = [pytest.mark.skipif(not has_dnnl, reason="DNNL not enabled.")]
 
 def _dnnl_regions(mod: tvm.IRModule) -> list[relax.Function]:
     """Helper to extract offloaded DNNL functions from partitioned module."""

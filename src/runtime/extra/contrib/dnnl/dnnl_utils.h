@@ -99,6 +99,33 @@ inline std::ostream& operator<<(std::ostream& o, const dnnl::memory::data_type& 
     case dnnl::memory::data_type::u8:
       name = "u8";
       break;
+    case dnnl::memory::data_type::f8_e5m2:
+      name = "f8_e5m2";
+      break;
+    case dnnl::memory::data_type::f8_e4m3:
+      name = "f8_e4m3";
+      break;
+    case dnnl::memory::data_type::f4_e3m0:
+      name = "f4_e3m0";
+      break;
+    case dnnl::memory::data_type::f4_e2m1:
+      name = "f4_e2m1";
+      break;
+    case dnnl::memory::data_type::e8m0:
+      name = "e8m0";
+      break;
+    case dnnl::memory::data_type::f64:
+      name = "f64";
+      break;
+    case dnnl::memory::data_type::s64:
+      name = "s64";
+      break;
+    case dnnl::memory::data_type::s4:
+      name = "s4";
+      break;
+    case dnnl::memory::data_type::u4:
+      name = "u4";
+      break;
   }
   o << name;
   return o;

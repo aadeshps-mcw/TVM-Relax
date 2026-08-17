@@ -283,8 +283,6 @@ _DNNL_COMPUTE_OPS = {
     "relax.nn.conv3d",
     "relax.nn.conv2d_transpose",
     "relax.nn.conv3d_transpose",
-    "relax.matmul",
-    "relax.nn.layer_norm",
 }
 
 

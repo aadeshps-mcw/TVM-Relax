@@ -81,9 +81,9 @@ def _make_conv2d_module(
 
 
 torch = pytest.importorskip("torch")
-import torch.nn as nn
+import torch.nn as nn  # noqa: E402
 
-from tvm.relax.frontend.torch import from_exported_program
+from tvm.relax.frontend.torch import from_exported_program  # noqa: E402
 
 # Helper: convert a torch.nn.Module into a Relax IRModule via torch.export
 

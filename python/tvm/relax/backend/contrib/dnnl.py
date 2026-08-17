@@ -107,7 +107,7 @@ def _dnnl_patterns() -> list[Pattern]:
     return patterns
 
 
-register_patterns(_dnnl_patterns())
+register_patterns(sorted(_dnnl_patterns(), key=lambda p: len(p[0])))
 
 
 def partition_for_dnnl(

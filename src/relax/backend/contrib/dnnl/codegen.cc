@@ -23,27 +23,31 @@
  *
  * Unlike TensorRT's composite functions (which always wrap exactly one primitive op), a DNNL
  * composite represents a *fused chain* -- e.g. "dnnl.conv2d_bias_relu" contains three primitive
- * calls: conv2d, add (bias), relu. So there is no single "root call" to resolve by name.
- * Baseline for this file is TensorRT's codegen.cc: instead of matching composite_name (or an op
- * name) against a table to decide which call to extract attrs from, we walk every binding in the
- * composite body once and, for every primitive call found:
- *   - copy its op attrs via the existing SetCallNodeAttribute() helper (same helper the original
- *     conv2d-only code used for its single root_call)
- *   - serialize its non-tensor scalar/shape arguments as "arg_<name>" attrs -- this is what
- *     replaces the old hardcoded "_clip" check; relax.clip's min/max are call args, not attrs,
- *     and this now applies to any op with such args, not just clip
- *   - append its op name to a "fused_ops" attr, so the runtime knows the fusion sequence without
- *     codegen needing a hardcoded list of which ops DNNL supports as post-ops
- * The leaf-tensor-input-gathering logic below (param_entries / add_leaf_if_new) was already fully
- * generic before this change and is unmodified in spirit -- it's folded into the same single walk
- * of the composite body's bindings so the body is only traversed once.
+ * calls: conv2d, add (bias), relu. So there is no single "root call" to resolve by name for
+ * everything -- ResolveRootCall() below still maps a composite name to its *root* op (the op
+ * whose attrs -- e.g. conv2d's strides/padding -- get copied onto the JSON node), while the
+ * single walk over the composite body's bindings additionally:
+ *   - serializes leaf tensor inputs (param_entries / add_leaf_if_new), including the case where
+ *     a leaf is a constant bound to an internal var rather than passed in directly, or a
+ *     constant fed straight into an op;
+ *   - records the start offset of every leaf's JSON entries in `leaf_start_index`, so
+ *     downstream passes (residual-add / QNN dequant) can reference "the Nth composite input"
+ *     without a second walk;
+ *   - collects every primitive op's name into a "fused_ops" attr, in body order, so the DNNL
+ *     runtime knows the fusion sequence without codegen needing a hardcoded list of which ops
+ *     DNNL supports as post-ops.
+ * Non-attr scalar call args (clip's min/max, the residual-add leaf, QNN's scale/zero_point) are
+ * extracted separately below since SetCallNodeAttribute() only pulls attrs off the *root* call.
  */
 #include <tvm/ffi/cast.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/module.h>
 #include <tvm/ir/op.h>
+#include <tvm/relax/attrs/qdq.h>
 #include <tvm/relax/expr.h>
 
+#include <algorithm>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -69,9 +73,9 @@ namespace {
  * CallNode for its underlying root op inside the composite function.
  *
  * Exact-match entries are used for patterns that have no fused variants sharing
- * a name prefix (matmul, layer_norm). Prefix-match entries are used for op
- * families with fused variants that all legitimately share a root op (the
- * conv2d family: dnnl.conv2d, dnnl.conv2d_relu, dnnl.conv2d_bias_relu, ...).
+ * a name prefix (matmul, layer_norm, elementwise ops, pooling, ...). Prefix-match
+ * entries are used for op families with fused variants that all legitimately share
+ * a root op (the conv2d family: dnnl.conv2d, dnnl.conv2d_relu, dnnl.conv2d_bias_relu, ...).
  *
  * Prefix matching is deliberately anchored at the start of the string
  * (not a substring search) so that, e.g., a future "dnnl.qnn.conv2d" pattern
@@ -79,11 +83,42 @@ namespace {
  */
 const CallNode* ResolveRootCall(const std::string& composite_name, const Function& fn) {
   static const std::unordered_map<std::string, std::string> kExactResolvers = {
-      {"dnnl.matmul", "relax.matmul"},
       {"dnnl.layer_norm", "relax.nn.layer_norm"},
+      {"dnnl.batch_norm", "relax.nn.batch_norm"},
+      {"dnnl.softmax", "relax.nn.softmax"},
+      {"dnnl.add", "relax.add"},
+      {"dnnl.multiply", "relax.multiply"},
+      {"dnnl.abs", "relax.abs"},
+      {"dnnl.exp", "relax.exp"},
+      {"dnnl.log", "relax.log"},
+      {"dnnl.sqrt", "relax.sqrt"},
+      {"dnnl.round", "relax.round"},
+      {"dnnl.relu", "relax.nn.relu"},
+      {"dnnl.leaky_relu", "relax.nn.leakyrelu"},
+      {"dnnl.tanh", "relax.tanh"},
+      {"dnnl.sigmoid", "relax.sigmoid"},
+      {"dnnl.clip", "relax.clip"},
+      {"dnnl.max_pool1d", "relax.nn.max_pool1d"},
+      {"dnnl.max_pool2d", "relax.nn.max_pool2d"},
+      {"dnnl.max_pool3d", "relax.nn.max_pool3d"},
+      {"dnnl.avg_pool1d", "relax.nn.avg_pool1d"},
+      {"dnnl.avg_pool2d", "relax.nn.avg_pool2d"},
+      {"dnnl.avg_pool3d", "relax.nn.avg_pool3d"},
+      {"dnnl.global_avg_pool2d", "relax.nn.adaptive_avg_pool2d"},
+      {"dnnl.conv2d", "relax.nn.conv2d"},
+      {"dnnl.matmul", "relax.matmul"},
+      {"dnnl.batch_matmul", "relax.nn.batch_matmul"},
+      {"dnnl.qnn.conv2d", "relax.nn.conv2d"},
+      {"dnnl.qnn.matmul", "relax.matmul"},
   };
   static const std::vector<std::pair<std::string, std::string>> kPrefixResolvers = {
+      {"dnnl.conv1d", "relax.nn.conv1d"},
+      {"dnnl.conv2d_transpose", "relax.nn.conv2d_transpose"},
       {"dnnl.conv2d", "relax.nn.conv2d"},
+      {"dnnl.conv3d_transpose", "relax.nn.conv3d_transpose"},
+      {"dnnl.conv3d", "relax.nn.conv3d"},
+      {"dnnl.matmul", "relax.matmul"},
+      {"dnnl.batch_matmul", "relax.nn.batch_matmul"},
   };
 
   auto exact_it = kExactResolvers.find(composite_name);
@@ -100,6 +135,73 @@ const CallNode* ResolveRootCall(const std::string& composite_name, const Functio
 
   TVM_FFI_THROW(InternalError) << "Unimplemented pattern: " << composite_name;
   return nullptr;
+}
+
+/*!
+ * \brief Returns true if composite_name contains `token` as a full underscore/dot-delimited
+ * segment (e.g. HasNameToken("dnnl.conv2d_bias_sum_relu", "sum") is true, but
+ * HasNameToken("dnnl.conv2d_summary", "sum") is false). Used only for name/body
+ * consistency assertions -- never to drive control flow.
+ */
+bool HasNameToken(const std::string& composite_name, const std::string& token) {
+  size_t start = 0;
+  while (start <= composite_name.size()) {
+    size_t end_underscore = composite_name.find('_', start);
+    size_t end_dot = composite_name.find('.', start);
+    size_t end = std::min(end_underscore, end_dot);
+    if (end == std::string::npos) end = composite_name.size();
+    if (composite_name.compare(start, end - start, token) == 0) return true;
+    start = end + 1;
+  }
+  return false;
+}
+
+/*!
+ * \brief Structurally searches the composite function body for a call to `op_name`.
+ * Returns nullptr if none is found (never throws), so callers can branch on presence
+ * rather than relying on the composite's name.
+ */
+const CallNode* FindOpCall(const SeqExprNode* seq, const std::string& op_name) {
+  for (const auto& block : seq->blocks) {
+    for (const auto& binding : block->bindings) {
+      const auto* vb = binding.as<VarBindingNode>();
+      const auto* call = vb->value.as<CallNode>();
+      if (!call) continue;
+      const auto* op_node = call->op.as<OpNode>();
+      if (op_node && op_node->name == op_name) return call;
+    }
+  }
+  return nullptr;
+}
+
+/*!
+ * \brief Structurally searches for a residual-add binding: add(chain, leaf) where
+ * chain is an internal var downstream of (but not equal to) root_var, and leaf is a
+ * tracked composite input. Returns std::nullopt if no such binding exists.
+ */
+std::optional<const VarNode*> FindResidualLeaf(
+    const SeqExprNode* seq, const VarNode* root_var,
+    const std::unordered_map<const VarNode*, NodeEntries>& param_entries) {
+  for (const auto& block : seq->blocks) {
+    for (const auto& binding : block->bindings) {
+      const auto* vb = binding.as<VarBindingNode>();
+      const auto* add_call = vb->value.as<CallNode>();
+      if (!add_call || add_call->args.size() != 2) continue;
+      const auto* op_node = add_call->op.as<OpNode>();
+      if (!op_node || op_node->name != "relax.add") continue;
+
+      for (int i = 0; i < 2; ++i) {
+        const auto* chain_var = add_call->args[i].as<VarNode>();
+        const auto* leaf_var = add_call->args[1 - i].as<VarNode>();
+        bool chain_is_downstream_internal =
+            chain_var && chain_var != root_var && !param_entries.count(chain_var);
+        if (chain_is_downstream_internal && leaf_var && param_entries.count(leaf_var)) {
+          return leaf_var;
+        }
+      }
+    }
+  }
+  return std::nullopt;
 }
 
 }  // namespace
@@ -129,7 +231,9 @@ class DNNLJSONSerializer : public JSONSerializer {
 
     NodeEntries inputs;
     std::unordered_set<const ffi::Object*> seen;
+    std::unordered_map<const ffi::Object*, size_t> leaf_start_index;
     std::unordered_map<const VarNode*, Expr> local_bindings;
+    ffi::Array<ffi::String> fused_ops;
 
     auto add_leaf_if_new = [&](const Expr& e) {
       const ffi::Object* key = e.get();
@@ -137,19 +241,23 @@ class DNNLJSONSerializer : public JSONSerializer {
       if (const auto* var_node = e.as<VarNode>()) {
         if (auto it = param_entries.find(var_node); it != param_entries.end()) {
           seen.insert(key);
+          leaf_start_index[key] = inputs.size();
           inputs.insert(inputs.end(), it->second.begin(), it->second.end());
           return;
         }
-        // Not an external param -- may be an internal var bound to a constant.
+        // Not an external param -- may be an internal var bound to a constant
+        // (e.g. a scalar hoisted into its own binding before being fed into an op).
         if (auto lb_it = local_bindings.find(var_node);
             lb_it != local_bindings.end() && lb_it->second.as<ConstantNode>()) {
           seen.insert(key);
+          leaf_start_index[key] = inputs.size();
           auto res = VisitExpr(lb_it->second);
           inputs.insert(inputs.end(), res.begin(), res.end());
         }
         // else: bound to a non-constant (e.g. another call's result) -- genuinely not a leaf
       } else if (e.as<ConstantNode>()) {
         seen.insert(key);
+        leaf_start_index[key] = inputs.size();
         auto res = VisitExpr(e);
         inputs.insert(inputs.end(), res.begin(), res.end());
       }
@@ -163,6 +271,9 @@ class DNNLJSONSerializer : public JSONSerializer {
         TVM_FFI_ICHECK(var_binding) << "Expected VarBinding inside composite function.";
         local_bindings[var_binding->var.get()] = var_binding->value;
         if (const auto* inner_call = var_binding->value.as<CallNode>()) {
+          if (const auto* op_node = inner_call->op.as<OpNode>()) {
+            fused_ops.push_back(op_node->name);
+          }
           for (const auto& arg : inner_call->args) {
             add_leaf_if_new(arg);
           }
@@ -182,10 +293,13 @@ class DNNLJSONSerializer : public JSONSerializer {
     // Extract them here and attach as "a_min"/"a_max" JSON attrs, which is what the DNNL
     // runtime's ParseAttrs() fallback (dnnl_json_runtime.cc) reads for "_clip"-suffixed
     // composites. Without this, clip silently runs with bounds (0, 0).
-    if (composite_name.find("_clip") != std::string::npos) {
-      const CallNode* clip_call = backend::GetOpInFunction(fn, "relax.clip");
-      TVM_FFI_ICHECK(clip_call) << "Expected to find relax.clip inside composite "
-                                << composite_name;
+    const CallNode* clip_call = FindOpCall(seq, "relax.clip");
+    TVM_FFI_ICHECK_EQ(clip_call != nullptr, HasNameToken(composite_name, "clip"))
+        << "Composite " << composite_name << " naming/body mismatch for clip pattern "
+        << "(name implies clip=" << HasNameToken(composite_name, "clip")
+        << ", body has relax.clip=" << (clip_call != nullptr) << ")";
+
+    if (clip_call != nullptr) {
       TVM_FFI_ICHECK_EQ(clip_call->args.size(), 3U)
           << "Expected relax.clip(x, min, max) to have 3 args";
 
@@ -197,8 +311,76 @@ class DNNLJSONSerializer : public JSONSerializer {
       node->SetAttr("a_min", min_imm->value);
       node->SetAttr("a_max", max_imm->value);
     }
-    node->SetAttr("fused_ops", std::move(fused_ops));
 
+    const VarNode* root_var = nullptr;
+    for (const auto& block : seq->blocks) {
+      for (const auto& binding : block->bindings) {
+        const auto* vb = binding.as<VarBindingNode>();
+        if (vb->value.get() == root_call) {
+          root_var = vb->var.get();
+          break;
+        }
+      }
+      if (root_var) break;
+    }
+    TVM_FFI_ICHECK(root_var) << "Could not locate binding for root call of " << composite_name;
+
+    auto residual = FindResidualLeaf(seq, root_var, param_entries);
+    TVM_FFI_ICHECK_EQ(residual.has_value(), HasNameToken(composite_name, "sum"))
+        << "Composite " << composite_name << " naming/body mismatch for residual-add pattern "
+        << "(name implies sum=" << HasNameToken(composite_name, "sum")
+        << ", body has residual=" << residual.has_value() << ")";
+
+    if (residual.has_value()) {
+      auto idx_it = leaf_start_index.find(static_cast<const ffi::Object*>(*residual));
+      TVM_FFI_ICHECK(idx_it != leaf_start_index.end())
+          << "Residual leaf for " << composite_name << " was not tracked as a composite input";
+      node->SetAttr("sum_idx", static_cast<int64_t>(idx_it->second));
+    }
+
+    bool is_qnn_composite = composite_name.rfind("dnnl.qnn.", 0) == 0;
+
+    if (is_qnn_composite) {
+      // Use FindOpCall, which safely returns nullptr instead of crashing
+      const CallNode* dequantize_call = FindOpCall(seq, "relax.dequantize");
+      TVM_FFI_ICHECK(dequantize_call != nullptr)
+          << "Composite " << composite_name << " naming implies a fused dequantize "
+          << "but none was found in the body.";
+      TVM_FFI_ICHECK_EQ(dequantize_call->args.size(), 3U)
+          << "Expected relax.dequantize(data, scale, zero_point) to have 3 args";
+
+      const Expr& scale_expr = dequantize_call->args[1];
+      const Expr& zp_expr = dequantize_call->args[2];
+
+      auto scale_idx_it = leaf_start_index.find(scale_expr.get());
+      auto zp_idx_it = leaf_start_index.find(zp_expr.get());
+      TVM_FFI_ICHECK(scale_idx_it != leaf_start_index.end())
+          << "QNN scale for " << composite_name << " was not tracked as a composite input "
+          << "(expected a constant leaf, per the is_const() pattern constraint)";
+      TVM_FFI_ICHECK(zp_idx_it != leaf_start_index.end())
+          << "QNN zero_point for " << composite_name << " was not tracked as a composite input";
+
+      // Reuse the EXISTING attr names the runtime already reads in ParseAttrs
+      node->SetAttr("o_scl_idx", static_cast<int64_t>(scale_idx_it->second));
+      node->SetAttr("dst_zp_idx", static_cast<int64_t>(zp_idx_it->second));
+
+      const auto* qattrs = dequantize_call->attrs.as<QuantizeAttrs>();
+      TVM_FFI_ICHECK(qattrs != nullptr) << "Expected relax.dequantize to carry QuantizeAttrs";
+      node->SetAttr("dst_axis", static_cast<int64_t>(qattrs->axis));
+
+    } else {
+      // Safely check for stray dequantize without crashing if it's missing
+      const CallNode* stray_dq = FindOpCall(seq, "relax.dequantize");
+      TVM_FFI_ICHECK(stray_dq == nullptr)
+          << "Composite " << composite_name << " body contains relax.dequantize but its "
+          << "name doesn't start with 'dnnl.qnn.' -- naming/body mismatch.";
+    }
+
+    // Record the fusion sequence (in body order) so the runtime can dispatch post-ops
+    // without codegen needing a hardcoded list of which ops DNNL supports as post-ops.
+    node->SetAttr("fused_ops", fused_ops);
+
+    SetCallNodeAttribute(node, root_call);
     return AddNode(node, ffi::GetRef<Expr>(call_node));
   }
 

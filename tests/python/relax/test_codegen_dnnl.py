@@ -85,7 +85,7 @@ def _offload_and_compare(mod, params_np, data_np, alter_layout=True, rtol=1e-4, 
     ref = build_and_run(mod, [data_np, *params_np.values()], legalize=True)
 
     bound = relax.transform.BindParams("main", params_np)(mod)
-    partitioned = partition_for_dnnl(bound, alter_layout=alter_layout)
+    partitioned = partition_for_dnnl(bound, alter_layout=alter_layout, run_codegen=False)
 
     # Guard against a silent false pass: if nothing matched, the op under test never actually
     # reaches the DNNL codegen path and the comparison below would trivially succeed via the TVM
@@ -417,7 +417,7 @@ def test_partition_for_dnnl_conv2d_stack():
     inputs = [data_np, weight1_np, weight2_np]
     ref = build_and_run(ConvStack, inputs, legalize=True)
 
-    partitioned = partition_for_dnnl(ConvStack, alter_layout=True)
+    partitioned = partition_for_dnnl(ConvStack, alter_layout=True, run_codegen=False)
     assert any(
         isinstance(fn, relax.Function)
         and fn.attrs is not None
@@ -471,7 +471,7 @@ def _compile_and_compare_model(
 
     mod, params_np = _torch_module_to_relax(torch_model, example_input)
 
-    partitioned = partition_for_dnnl(mod, alter_layout=alter_layout)
+    partitioned = partition_for_dnnl(mod, alter_layout=alter_layout, run_codegen=False)
     dnnl_funcs = [
         gv.name_hint
         for gv, func in partitioned.functions.items()

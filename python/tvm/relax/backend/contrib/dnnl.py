@@ -17,16 +17,27 @@
 
 """Pattern table and partitioning for the DNNL BYOC backend.
 
-Still worth independently re-verifying against the current relax op registry:
-  - QNN/int8 quantized fusion patterns (kept from the "broad" revision, but
-    its own docstring never claimed these were cross-checked against Relay).
-  - Exact op names for gelu ("relax.nn.gelu" vs "relax.gelu") and swish/mish
-    on your TVM revision.
+This file covers bare ops, bias/activation/clip fusion, and conv2d/matmul bias+sum(+relu)
+residual fusion for the DNNL backend.
+
+  - QNN/int8 fusion beyond the base case. Bare quantized conv2d/dense (no bias, activation, or
+    sum) is covered by make_qnn_conv2d_pattern() and make_qnn_dense_pattern(), which produce the
+    dnnl.qnn.conv2d and dnnl.qnn.matmul composites. Keep these two names stable, and check for
+    collisions before renaming either one.
+  - swish and mish as decomposed multi-op activation patterns. The legacy Relay version builds
+    these from primitive ops (e.g. swish as sigmoid followed by multiply) because Relay had no
+    fused op for them. They aren't wired into _FUSABLE_ACTIVATIONS below. gelu is wired in even
+    though the same question of whether Relax has a native op for it applies just as much; that
+    inconsistency is worth resolving one way or the other.
+
+Clip fusion (dnnl.<op>_clip, dnnl.<op>_bias_clip) is generated generically for every op in
+_FUSABLE_OPS, the same way bias and activation fusion are; see _fused_patterns().
 """
+
+import numpy as np
 
 import tvm
 from tvm import relax, tirx
-from tvm.relax.backend.patterns import make_matmul_dequantize_pattern
 from tvm.relax.dpl import (
     is_const,
     is_expr,
@@ -43,6 +54,8 @@ from tvm.relax.transform import (
 )
 
 from ..pattern_registry import Pattern, register_patterns
+
+# Constants
 
 SUPPORTED_ELTWISE = {
     "abs",
@@ -62,9 +75,8 @@ SUPPORTED_ELTWISE = {
     "silu",
 }
 
-# Ops for which DNNL implements a fused bias-add + activation post-op chain.
-# layer_norm is deliberately excluded -- it isn't followed by a DNNL-fusable
-# activation the way conv/matmul are.
+# Ops for which DNNL implements a fused bias-add, activation, and clip post-op chain. layer_norm
+# is excluded here since it isn't followed by a DNNL-fusable activation the way conv/matmul are.
 _FUSABLE_OPS: list[str] = [
     "relax.nn.conv1d",
     "relax.nn.conv2d",
@@ -74,44 +86,142 @@ _FUSABLE_OPS: list[str] = [
     "relax.matmul",
 ]
 
-# Activations DNNL can fuse as a post-op, plus the runtime op name each maps to
-# for _validate_eltwise_op_name / the eltwise checker below. "swish" is kept in
-# this generalized list (rather than hand-special-cased to conv2d only) since
-# silu == swish(beta=1) and there's no reason bias+swish fusion is conv2d-specific.
-_ACTIVATIONS = [
-    ("relu", "relax.nn.relu"),
-    ("tanh", "relax.tanh"),
-    ("sigmoid", "relax.sigmoid"),
-    ("gelu", "relax.nn.gelu"),
-    (
-        "swish",
-        "relax.nn.silu",
-    ),  # silu == swish(beta=1); DNNL runtime keys off "_swish"
+# Activations DNNL can fuse as a post-op. None means bias-only, no activation, which is a valid
+# combination on its own (e.g. "dnnl.conv2d_bias"). Extend this list and the runtime's op-name to
+# dnnl::algorithm table in ParseAttrs together; codegen.cc doesn't need to change either way.
+# These op names need to match the current relax op registry, gelu especially, since it may be
+# named differently across TVM revisions (see the module docstring for more on gelu).
+_FUSABLE_ACTIVATIONS: list[str | None] = [
+    None,
+    "relax.nn.relu",
+    "relax.sigmoid",
+    "relax.nn.gelu",
+    "relax.tanh",
 ]
 
+# Rank, is_transpose, and (data_layout, kernel_layout) for every conv variant this backend
+# handles. This is the single source of truth for ConvertLayout's desired_layouts in
+# partition_for_dnnl. The kernel layout is intentionally IO-swapped (IOHW/IODHW) for the
+# transpose variants, since a deconv weight tensor's channel-axis convention differs from a
+# regular conv weight's.
+_CONV_LAYOUT_QUERY_SPECS: dict[str, tuple[int, bool, list[str]]] = {
+    "relax.nn.conv1d": (1, False, ["NCW", "OIW"]),
+    "relax.nn.conv2d": (2, False, ["NCHW", "OIHW"]),
+    "relax.nn.conv3d": (3, False, ["NCDHW", "OIDHW"]),
+    "relax.nn.conv2d_transpose": (2, True, ["NCHW", "IOHW"]),
+    "relax.nn.conv3d_transpose": (3, True, ["NCDHW", "IODHW"]),
+}
 
-def _get_dtype(node):
+# Ops that count as real DNNL compute for prune_dnnl_subgraphs; see _count_compute_ops.
+# for testing all the ops are included to the list.
+_DNNL_COMPUTE_OPS = {
+    "relax.nn.conv1d",
+    "relax.nn.conv2d",
+    "relax.nn.conv3d",
+    "relax.nn.conv2d_transpose",
+    "relax.nn.conv3d_transpose",
+    "relax.matmul",
+    "relax.nn.batch_matmul",
+    "relax.nn.layer_norm",
+    "relax.abs",
+    "relax.exp",
+    "relax.log",
+    "relax.sqrt",
+    "relax.round",
+    "relax.tanh",
+    "relax.sigmoid",
+    "relax.clip",
+    "relax.nn.relu",
+    "relax.nn.leakyrelu",
+    "relax.add",
+    "relax.multiply",
+    "relax.nn.adaptive_avg_pool2d",
+    "relax.nn.max_pool1d",
+    "relax.nn.max_pool2d",
+    "relax.nn.max_pool3d",
+    "relax.nn.avg_pool1d",
+    "relax.nn.avg_pool2d",
+    "relax.nn.avg_pool3d",
+    "relax.nn.softmax",
+    "relax.nn.batch_norm",
+}
+
+
+# Shared helpers
+
+
+def _get_dtype(node) -> str | None:
     ty = getattr(node, "ty", None)
     if ty is None:
         return None
     return getattr(ty, "dtype", None)
 
 
-def _reject_int64(call):
-    """Safety guard: oneDNN does not natively support int64."""
-    out_dtype = _get_dtype(call)
-    if out_dtype == "int64":
+def _has_int64(*exprs) -> bool:
+    """Returns True if any of exprs has an int64 dtype."""
+    return any(_get_dtype(e) == "int64" for e in exprs)
+
+
+def _reject_int64(call) -> bool:
+    """oneDNN doesn't natively support int64, so this rejects a call if its output dtype, any of
+    its argument dtypes, or an explicit out_dtype attr (for ops that carry one) is int64."""
+    if _has_int64(call, *call.args):
         return False
-
-    for arg in call.args:
-        if _get_dtype(arg) == "int64":
-            return False
-
     if call.attrs is not None and hasattr(call.attrs, "out_dtype"):
         if str(call.attrs.out_dtype) == "int64":
             return False
-
     return True
+
+
+def _is_valid_broadcast_bias(bias_dims, channel_dim) -> bool:
+    """True if bias_dims describes a scalar, or a tensor with exactly one non-1-sized dimension
+    that matches the op's channel dimension. This covers both the 1D (oc,) convention and the
+    (oc, 1, 1)-style NCHW-broadcast convention; any rank works as long as there's only one real
+    axis."""
+    if len(bias_dims) == 0:
+        return True
+
+    non_unit = [d for d in bias_dims if not (isinstance(d, tirx.IntImm) and d.value == 1)]
+    if len(non_unit) == 0:
+        return True  # all ones, trivially broadcastable
+    if len(non_unit) > 1:
+        return False  # more than one real axis, not a simple per-channel bias
+
+    dim = non_unit[0]
+    if isinstance(dim, tirx.IntImm) and isinstance(channel_dim, tirx.IntImm):
+        return dim.value == channel_dim.value
+    return True  # dynamic dimension, can't rule it out statically, so don't block the match
+
+
+def _is_scalar_or_size1_const(expr) -> bool:
+    """True if expr's shape is 0-d, or 1-d with exactly one element. Only a scalar, per-tensor
+    output rescale is accepted."""
+    ty = getattr(expr, "ty", None)
+    shape = getattr(ty, "shape", None)
+    if shape is None:
+        return True  # can't prove it isn't scalar, so let it through and let the runtime check
+    dims = list(shape.values)
+    if len(dims) == 0:
+        return True
+    if len(dims) == 1 and isinstance(dims[0], tirx.IntImm) and dims[0].value == 1:
+        return True
+    return False
+
+
+def _validate_eltwise_op_name(op_name: str) -> None:
+    """Raises instead of silently excluding, for op names that reach DNNL codegen through a path
+    that should always be a known, closed set. This is different from dnnl_eltwise_checker's
+    pattern-matching context, where returning False just means "don't offload this", which makes
+    sense for runtime-shaped inputs but not for the fixed, compile-time-known set of activation
+    post-ops used here."""
+    if op_name not in SUPPORTED_ELTWISE:
+        raise ValueError(
+            f"Unsupported DNNL eltwise/activation post-op: {op_name!r}. "
+            f"Supported: {sorted(SUPPORTED_ELTWISE)}"
+        )
+
+
+# Pattern-match checkers
 
 
 def dnnl_pooling_checker(ctx) -> bool:
@@ -122,13 +232,11 @@ def dnnl_pooling_checker(ctx) -> bool:
 
 
 def dnnl_global_avg_pool2d_checker(ctx) -> bool:
-    """Only true global average pooling (output_size == (1, 1)) is valid here.
-    A general adaptive_avg_pool2d with a larger output_size is a materially
-    different computation -- oneDNN's pooling_forward primitive can't express
-    per-window variable kernel sizes, so offloading it produces a malformed
-    descriptor at runtime ('could not create a descriptor for a pooling
-    forward propagation primitive'). Non-(1,1) adaptive pools correctly fall
-    through to TVM's native implementation instead.
+    """Only true global average pooling, where output_size is (1, 1), is valid here. A general
+    adaptive_avg_pool2d with a larger output_size is a materially different computation, since
+    oneDNN's pooling_forward primitive can't express per-window variable kernel sizes. Offloading
+    it would produce a malformed descriptor at runtime. Adaptive pools with any other output size
+    fall through to TVM's native implementation instead.
     """
     call = ctx.matched_expr
     output_size = tuple(int(v) for v in call.attrs.output_size)
@@ -138,29 +246,9 @@ def dnnl_global_avg_pool2d_checker(ctx) -> bool:
 
 
 def dnnl_conv_checker(ctx) -> bool:
-    """int64-rejection guard shared by every bare conv/matmul base pattern
-    (conv1d/2d/3d, transposed variants, matmul)."""
+    """Shared int64-rejection guard for every bare conv/matmul base pattern: conv1d, conv2d,
+    conv3d, their transposed variants, and matmul."""
     return _reject_int64(ctx.matched_expr)
-
-
-def _is_valid_broadcast_bias(bias_dims, channel_axis, channel_dim) -> bool:
-    """True if bias_dims describes a scalar, or a tensor with exactly one
-    non-1-sized dimension that matches the op's channel dimension (covers
-    both the 1D (oc,) convention and the (oc, 1, 1)-style NCHW-broadcast
-    convention -- any rank is fine as long as there's only one real axis)."""
-    if len(bias_dims) == 0:
-        return True
-
-    non_unit = [d for d in bias_dims if not (isinstance(d, tirx.IntImm) and d.value == 1)]
-    if len(non_unit) == 0:
-        return True  # all-1s, trivially broadcastable
-    if len(non_unit) > 1:
-        return False  # more than one "real" axis -- not a simple per-channel bias
-
-    dim = non_unit[0]
-    if isinstance(dim, tirx.IntImm) and isinstance(channel_dim, tirx.IntImm):
-        return dim.value == channel_dim.value
-    return True  # dynamic dim -- can't statically rule out, don't block the match
 
 
 def dnnl_eltwise_checker(ctx) -> bool:
@@ -174,42 +262,46 @@ def dnnl_eltwise_checker(ctx) -> bool:
     return _reject_int64(call)
 
 
-def _validate_eltwise_op_name(op_name: str) -> None:
-    """Strict guard: raises rather than silently excluding, for op names that
-    reach DNNL codegen through a path that should always be a known, closed set
-    (as opposed to dnnl_eltwise_checker's pattern-matching context, where
-    returning False just means 'don't offload this' -- appropriate for
-    runtime-shaped inputs, but not for the fixed, compile-time-known set of
-    activation post-ops below)."""
-    if op_name not in SUPPORTED_ELTWISE:
-        raise ValueError(
-            f"Unsupported DNNL eltwise/activation post-op: {op_name!r}. "
-            f"Supported: {sorted(SUPPORTED_ELTWISE)}"
-        )
+def dnnl_qnn_checker(context: PatternCheckContext) -> bool:
+    """Shared checker for the dnnl.qnn.conv2d and dnnl.qnn.matmul base patterns."""
+    op_expr = context.annotated_expr["op"]
+    scale_expr = context.annotated_expr["scale"]
+    zp_expr = context.annotated_expr["zp"]
+
+    if _has_int64(op_expr, scale_expr, zp_expr):
+        return False
+    if not _is_scalar_or_size1_const(scale_expr):
+        return False
+    if not _is_scalar_or_size1_const(zp_expr):
+        return False
+    return True
+
+
+# Pattern builders
 
 
 def _op_pattern(composite_name: str, op_name: str, num_args: int, checker=None) -> Pattern:
-    """A pattern matching a single op called with ``num_args`` wildcard arguments."""
+    """A pattern matching a single op called with num_args wildcard arguments."""
     args = [wildcard() for _ in range(num_args)]
     pat = is_op(op_name)(*args)
-    # The empty dictionary {} is required as the 3rd element for annotations
+    # The empty dictionary {} is required as the 3rd element for annotations.
     return (composite_name, pat, {}, checker) if checker else (composite_name, pat, {})
 
 
-def _make_conv2d_dequantize_pattern():
-    """conv2d(data, weight) -> dequantize(out, scale, zp). Runs conv2d in float;
-    scale/zp are compile-time constants folded into a DNNL output rescale post-op
-    (reuses the existing o_scl_idx/dst_zp_idx runtime machinery -- see ParseAttrs
-    in dnnl_json_runtime.cc). This does NOT execute the convolution itself in int8."""
-    data = wildcard()
-    weight = wildcard()
-    out = is_op("relax.nn.conv2d")(data, weight)
+def _base_name(op_name: str) -> str:
+    """Turns "relax.nn.conv2d" into "dnnl.conv2d"."""
+    return f"dnnl.{op_name.rsplit('.', 1)[-1]}"
 
-    scale = is_const()
-    zp = is_const()
-    out = is_op("relax.dequantize")(out, scale, zp)
 
-    return out, {"data": data, "weight": weight, "scale": scale, "zp": zp}
+def _composite_name_for(op_name: str, with_bias: bool, activation: str | None) -> str:
+    """Builds a composite name, e.g. ("relax.nn.conv2d", True, "relax.nn.relu") becomes
+    "dnnl.conv2d_bias_relu"."""
+    parts = [_base_name(op_name)]
+    if with_bias:
+        parts.append("bias")
+    if activation is not None:
+        parts.append(activation.rsplit(".", 1)[-1])
+    return "_".join(parts)
 
 
 def _make_clip_pattern(op_name: str, with_bias: bool):
@@ -225,16 +317,59 @@ def _make_clip_pattern(op_name: str, with_bias: bool):
     return out
 
 
+def _fused_patterns() -> list[Pattern]:
+    """Generates every (op, with_bias, activation) combination instead of hand-listing them,
+    plus clip fusion for each op. Clip is built separately since its bounds aren't expressible
+    through make_fused_bias_activation_pattern's activation argument; see _make_clip_pattern.
+    These fused and clip patterns don't reject int64 inputs the way the bare op patterns do.
+
+    To extend fusion coverage with a new activation or a new fusable op, add one entry to
+    _FUSABLE_OPS or _FUSABLE_ACTIVATIONS above. Nothing else in this function needs to change.
+    """
+    patterns: list[Pattern] = []
+    for op_name in _FUSABLE_OPS:
+        for with_bias in (False, True):
+            for activation in _FUSABLE_ACTIVATIONS:
+                if not with_bias and activation is None:
+                    continue  # already covered by the bare pattern in _dnnl_patterns()
+                if activation is not None:
+                    _validate_eltwise_op_name(activation.replace("relax.", "").replace("nn.", ""))
+                pat = make_fused_bias_activation_pattern(
+                    op_name, with_bias=with_bias, activation=activation
+                )
+                patterns.append((_composite_name_for(op_name, with_bias, activation), pat))
+
+        patterns.append(
+            (f"{_base_name(op_name)}_clip", _make_clip_pattern(op_name, with_bias=False))
+        )
+        patterns.append(
+            (f"{_base_name(op_name)}_bias_clip", _make_clip_pattern(op_name, with_bias=True))
+        )
+
+    return patterns
+
+
+# Bias plus residual-sum, with an optional activation, fusion.
+#
+# This matches the legacy pattern table's scope exactly: conv2d gets both the relu and no-relu
+# sum variant, matmul gets only the no-relu sum variant. It isn't generalized beyond what was
+# actually validated upstream.
+#
+# Unlike the bias and activation loop above, this needs its own builder. The residual operand is
+# a second full tensor input rather than a scalar or activation choice, so it can't be expressed
+# as another axis of that same loop.
+
+
 def _sum_pattern(op_name: str, channel_axis: int, with_relu: bool) -> Pattern:
-    """<op>(data, weight) + bias + residual, optionally followed by relu.
+    """Matches op(data, weight) plus bias plus a residual, optionally followed by relu.
 
-    channel_axis is where the op's output channel dimension lives (1 for
-    NCHW-style conv output, -1 for matmul's last-dim output) -- used by the
-    predicate below to check the bias is actually shaped like a per-channel
-    bias, not some other broadcastable-but-wrong-length tensor.
+    channel_axis is where the op's output channel dimension lives: 1 for NCHW-style conv output,
+    -1 for matmul's last-dim output. The predicate below uses it to check that the bias is
+    actually shaped like a per-channel bias, rather than some other tensor that just happens to
+    be broadcastable.
 
-    Distinct from bias-only fusion: this matches a *second* add whose other
-    operand is an external residual tensor, not the bias.
+    This is distinct from bias-only fusion: it matches a second add whose other operand is an
+    external residual tensor, not the bias.
     """
     data1 = wildcard()
     weight = wildcard()
@@ -246,38 +381,33 @@ def _sum_pattern(op_name: str, channel_axis: int, with_relu: bool) -> Pattern:
     summed = is_op("relax.add")(biased, data2)
     root = is_op("relax.nn.relu")(summed) if with_relu else summed
 
-    base = op_name.rsplit(".", 1)[-1]
-    name = f"dnnl.{base}_bias_sum" + ("_relu" if with_relu else "")
+    name = f"{_base_name(op_name)}_bias_sum" + ("_relu" if with_relu else "")
 
     def check(context: PatternCheckContext) -> bool:
         op_expr = context.annotated_expr["op"]
         bias_expr = context.annotated_expr["bias"]
         data2_expr = context.annotated_expr["data2"]
 
-        # NOTE: verify .ty / .ty.shape access against your TVM build -- grounded
-        # in the existing tensorrt resize2d predicate's use of `.ty.ndim` /
-        # `.ty.dtype` / `.ty.shape`, but this predicate additionally indexes
-        # into per-dimension values, which that example did not do.
+        # This follows the same .ty / .ty.shape access pattern as the tensorrt resize2d
+        # predicate, but also indexes into individual dimension values, which that one doesn't.
         if op_expr.ty.shape is None or data2_expr.ty.shape is None:
             return False
         out_dims = list(op_expr.ty.shape.values)
         sum_dims = list(data2_expr.ty.shape.values)
 
-        # Residual add must be a true elementwise match against the op's own
-        # output shape.
+        # The residual add must be a true elementwise match against the op's own output shape.
         if len(out_dims) != len(sum_dims):
             return False
         for a, b in zip(out_dims, sum_dims):
             if isinstance(a, tirx.IntImm) and isinstance(b, tirx.IntImm) and a.value != b.value:
                 return False
 
-        # Bias must be a scalar or a 1D tensor sized to the op's channel
-        # dimension -- catches a bias that merely happens to be broadcastable
-        # but isn't actually a per-channel bias.
+        # The bias must be a scalar or a 1D tensor sized to the op's channel dimension, which
+        # catches a bias that merely happens to be broadcastable but isn't actually per-channel.
         if bias_expr.ty.shape is not None:
             bias_dims = list(bias_expr.ty.shape.values)
             channel_dim = out_dims[channel_axis]
-            if not _is_valid_broadcast_bias(bias_dims, channel_axis, channel_dim):
+            if not _is_valid_broadcast_bias(bias_dims, channel_dim):
                 return False
 
         return True
@@ -291,52 +421,17 @@ def _sum_pattern(op_name: str, channel_axis: int, with_relu: bool) -> Pattern:
 
 
 def _sum_patterns() -> list[Pattern]:
-    """Bias + residual-sum (+ activation) fusion. Scope matched 1:1 against the
-    legacy Relay pattern table: conv2d gets both the relu and no-relu sum
-    variant; matmul gets only the no-relu sum variant."""
     return [
-        _sum_pattern("relax.nn.conv2d", channel_axis=1, with_relu=True),
         _sum_pattern("relax.nn.conv2d", channel_axis=1, with_relu=False),
+        _sum_pattern("relax.nn.conv2d", channel_axis=1, with_relu=True),
         _sum_pattern("relax.matmul", channel_axis=-1, with_relu=False),
     ]
 
 
-def _make_fused_variants(prefix: str, op_name: str) -> list[Pattern]:
-    """Build the full bias/activation/clip pattern family for a single base op.
-
-    e.g. prefix="dnnl.conv2d", op_name="relax.nn.conv2d" produces
-    dnnl.conv2d_relu, dnnl.conv2d_bias_relu, ..., dnnl.conv2d_clip,
-    dnnl.conv2d_bias_clip, dnnl.conv2d_bias.
-
-    Extending fusion coverage (a new activation, a new fusable op) means
-    adding one entry to _ACTIVATIONS or _FUSABLE_OPS -- nothing else in this
-    function or its caller changes.
-    """
-    patterns: list[Pattern] = []
-
-    for suffix, act_op in _ACTIVATIONS:
-        act_short = act_op.replace("relax.", "").replace("nn.", "")
-        _validate_eltwise_op_name(act_short)
-
-        pat_bias = make_fused_bias_activation_pattern(op_name, with_bias=True, activation=act_op)
-        patterns.append((f"{prefix}_bias_{suffix}", pat_bias))
-
-        pat_nobias = make_fused_bias_activation_pattern(op_name, with_bias=False, activation=act_op)
-        patterns.append((f"{prefix}_{suffix}", pat_nobias))
-
-    # clip fusion isn't expressible via make_fused_bias_activation_pattern's
-    # activation arg, so it's built separately.
-    patterns.append((f"{prefix}_clip", _make_clip_pattern(op_name, with_bias=False)))
-    patterns.append((f"{prefix}_bias_clip", _make_clip_pattern(op_name, with_bias=True)))
-
-    # Bias-only, no activation.
-    pat_bias_only = make_fused_bias_activation_pattern(op_name, with_bias=True, activation=None)
-    patterns.append((f"{prefix}_bias", pat_bias_only))
-
-    return patterns
-
-
 def _standalone_patterns() -> list[Pattern]:
+    """Bare, unfused op patterns: elementwise ops, clip, pooling, softmax, add, multiply,
+    batch_norm, and true global average pooling. See _dnnl_patterns() for where these get
+    registered."""
     patterns: list[Pattern] = []
 
     _ELTWISE_OPS = [
@@ -353,9 +448,8 @@ def _standalone_patterns() -> list[Pattern]:
     for suffix, op_name in _ELTWISE_OPS:
         patterns.append(_op_pattern(f"dnnl.{suffix}", op_name, 1, dnnl_eltwise_checker))
 
-    # clip as a standalone op has no preceding conv/matmul, so this needs its
-    # own tiny pattern rather than reusing _make_clip_pattern's conv/matmul
-    # -rooted shape.
+    # Clip as a standalone op has no preceding conv or matmul, so it needs its own small pattern
+    # instead of reusing _make_clip_pattern's conv/matmul-rooted shape.
     patterns.append(_op_pattern("dnnl.clip", "relax.clip", 3, dnnl_eltwise_checker))
 
     for suffix, op_name in [
@@ -383,74 +477,109 @@ def _standalone_patterns() -> list[Pattern]:
     return patterns
 
 
+def make_qnn_conv2d_pattern() -> Pattern:
+    """Base quantized-conv2d pattern: relax.nn.conv2d(data, weight) followed by
+    relax.dequantize(out, scale, zp).
+
+    Returns
+    -------
+    pattern : Pattern
+        ("dnnl.qnn.conv2d", DFPattern, annotation_map, dnnl_qnn_checker), ready to hand to
+        register_patterns() directly, matching the calling convention _op_pattern() and the
+        other pattern builders in this file use. See _dnnl_patterns() below.
+    """
+    data = wildcard()
+    weight = wildcard()
+    op = is_op("relax.nn.conv2d")(data, weight)
+
+    scale = is_const()
+    zp = is_const()
+    out = is_op("relax.dequantize")(op, scale, zp)
+
+    ann = {"data": data, "weight": weight, "op": op, "scale": scale, "zp": zp}
+    return ("dnnl.qnn.conv2d", out, ann, dnnl_qnn_checker)
+
+
+def make_qnn_dense_pattern() -> Pattern:
+    """Base quantized-dense pattern: relax.matmul(data, weight) followed by relax.dequantize(out,
+    scale, zp). "Dense" here means relax.matmul, matching how the rest of this file (dnnl.matmul,
+    _FUSABLE_OPS, _sum_patterns) already treats relax.matmul as the dense op. There's no separate
+    relax.nn.dense composite family here.
+
+    Returns
+    -------
+    pattern : Pattern
+        ("dnnl.qnn.matmul", DFPattern, annotation_map, dnnl_qnn_checker).
+    """
+    data = wildcard()
+    weight = wildcard()
+    op = is_op("relax.matmul")(data, weight)
+
+    scale = is_const()
+    zp = is_const()
+    out = is_op("relax.dequantize")(op, scale, zp)
+
+    ann = {"data": data, "weight": weight, "op": op, "scale": scale, "zp": zp}
+    return ("dnnl.qnn.matmul", out, ann, dnnl_qnn_checker)
+
+
 def _dnnl_patterns() -> list[Pattern]:
     patterns: list[Pattern] = []
 
-    # 1. Base ops (no-fusion fallback): every bare conv variant + matmul +
-    # layer_norm, each guarded against int64 (layer_norm excluded from the
-    # guard family since it was never observed producing int64 issues, matching
-    # the original scope).
-    _BASE_OPS = [
-        ("dnnl.conv1d", "relax.nn.conv1d", 2),
-        ("dnnl.conv2d", "relax.nn.conv2d", 2),
-        ("dnnl.conv3d", "relax.nn.conv3d", 2),
-        ("dnnl.conv2d_transpose", "relax.nn.conv2d_transpose", 2),
-        ("dnnl.conv3d_transpose", "relax.nn.conv3d_transpose", 2),
-        ("dnnl.matmul", "relax.matmul", 2),
-    ]
-    for composite, op_name, nargs in _BASE_OPS:
-        patterns.append(_op_pattern(composite, op_name, nargs, dnnl_conv_checker))
+    # Bare conv/matmul base patterns, guarded by dnnl_conv_checker's int64 rejection, shared
+    # across every rank and transpose variant plus matmul.
+    for composite, op in [
+        ("dnnl.conv1d", "relax.nn.conv1d"),
+        ("dnnl.conv2d", "relax.nn.conv2d"),
+        ("dnnl.conv3d", "relax.nn.conv3d"),
+        ("dnnl.conv2d_transpose", "relax.nn.conv2d_transpose"),
+        ("dnnl.conv3d_transpose", "relax.nn.conv3d_transpose"),
+        ("dnnl.matmul", "relax.matmul"),
+    ]:
+        patterns.append(_op_pattern(composite, op, 2, dnnl_conv_checker))
     patterns.append(_op_pattern("dnnl.layer_norm", "relax.nn.layer_norm", 3))
 
-    # 2. Fused variants (bias / activation / clip), generated across every
-    # fusable op via itertools-style enumeration (see _FUSABLE_OPS).
-    for op_name in _FUSABLE_OPS:
-        base = op_name.rsplit(".", 1)[-1]
-        prefix = f"dnnl.{base}"
-        patterns.extend(_make_fused_variants(prefix, op_name))
+    # Bare pooling, eltwise, softmax, add, multiply, batch_norm, and global average pool patterns.
+    patterns.extend(_standalone_patterns())
 
-    # 3. Bias + residual-sum (+ optional relu) fusion, with real shape
-    # validation (see _sum_pattern's predicate).
+    # Fused ops: bias-add, activation, and clip, for every (op, with_bias, activation)
+    # combination. See _fused_patterns() to extend.
+    patterns.extend(_fused_patterns())
+
+    # Bias plus residual-sum, with an optional relu, fusion. See _sum_patterns() to extend.
     patterns.extend(_sum_patterns())
 
-    # 4. QNN / dequantize fusion (int8-adjacent: runs in float, folds
-    # scale/zp into a DNNL output-rescale post-op). Kept from the broader
-    # revision -- still worth an independent re-check against Relay's legacy
-    # qnn.conv2d/qnn.dense + requantize + sum patterns before relying on it
-    # for anything beyond simple dequantize folding.
-    out, ann = _make_conv2d_dequantize_pattern()
-    patterns.append(("dnnl.qnn.conv2d", out, ann))
-    out, ann = make_matmul_dequantize_pattern(transposed_rhs=False)
-    patterns.append(("dnnl.qnn.matmul", out, ann))
-
-    # 5. Standalone ops (no preceding conv/matmul to fuse with).
-    patterns.extend(_standalone_patterns())
+    # Base QNN (int8) patterns.
+    patterns.append(make_qnn_conv2d_pattern())
+    patterns.append(make_qnn_dense_pattern())
 
     return patterns
 
 
 def _ordered_dnnl_patterns() -> list[Pattern]:
-    """Patterns in match-priority order: most specific (largest fused subgraph)
-    first, so FuseOpsByPattern's greedy matching doesn't let a smaller generic
-    pattern (e.g. dnnl.conv2d_bias) pre-empt a larger one (e.g.
-    dnnl.conv2d_bias_relu) that shares the same conv2d+bias prefix."""
+    """Returns patterns in match-priority order, with the most specific and largest fused
+    subgraphs first. This keeps FuseOpsByPattern's greedy matching from letting a smaller,
+    generic pattern like dnnl.conv2d_bias pre-empt a larger one like dnnl.conv2d_bias_relu that
+    shares the same conv2d+bias prefix."""
     all_patterns = _dnnl_patterns()
-    # Longer composite name generally implies a more specific / larger pattern
-    # here since we build names as dnnl.<base>[_bias][_<activation>].
+    # A longer composite name generally means a more specific, larger pattern here, since names
+    # are built as dnnl.<base>, optionally followed by _bias and then _<activation> or _clip.
     return sorted(all_patterns, key=lambda p: -len(p[0]))
 
 
 register_patterns(_dnnl_patterns())
 
 
+# Graph rewrites
+
+
 def _unwrap_batch_norm_tuple_output(mod: tvm.IRModule) -> tvm.IRModule:
-    """FuseOpsByPattern can only anchor a match on a CallNode binding, so the
-    dnnl.batch_norm composite absorbs the bare batch_norm call but not the
-    TupleGetItem(call, 0) that follows it at each call site. This rewrites
-    the composite's Codegen function to return element 0 only (fixing its
-    return type), then collapses the downstream TupleGetItem at every
-    call site into the call result directly -- reconstructing the call with
-    an explicit ret_ty rather than reusing the stale (3-tuple-typed) node.
+    """FuseOpsByPattern can only anchor a match on a CallNode binding, so the dnnl.batch_norm
+    composite absorbs the bare batch_norm call but not the TupleGetItem(call, 0) that follows it
+    at each call site. This rewrites the composite's Codegen function to return element 0 only,
+    fixing its return type, then collapses the downstream TupleGetItem at every call site into
+    the call result directly, reconstructing the call with an explicit ret_ty rather than reusing
+    the stale, tuple-typed node.
     """
     targets: set[str] = set()
     for gvar, func in mod.functions.items():
@@ -476,8 +605,8 @@ def _unwrap_batch_norm_tuple_output(mod: tvm.IRModule) -> tvm.IRModule:
 
     new_mod = tvm.IRModule(mod.functions)
 
-    # Step 1: fix each target Codegen function to return element 0, and
-    # remember its new (single-tensor) return type for step 2.
+    # Step 1: fix each target Codegen function to return element 0, and remember its new
+    # (single-tensor) return type for step 2.
     target_ret_tys: dict[str, tvm.ir.Type] = {}
     for name in targets:
         gvar = new_mod.get_global_var(name)
@@ -498,14 +627,12 @@ def _unwrap_batch_norm_tuple_output(mod: tvm.IRModule) -> tvm.IRModule:
         new_mod[gvar] = relax.Function(func.params, new_body, new_ret_ty, func.is_pure, func.attrs)
 
     # Step 2: retype call sites and collapse the downstream TupleGetItem.
-    # NOTE: visit_call_ retypes the call; this mutator's base var-remap then
-    # automatically propagates that new type onto any Var (e.g. `lv`) bound
-    # to the call, *before* visit_tuple_getitem_ sees it. So by the time
-    # visit_tuple_getitem_ resolves tuple_value, it may already be a plain
-    # tensor-typed var rather than a tuple -- we must NOT call
-    # super().visit_tuple_getitem_() (it assumes tuple_value stays a
-    # TupleType and throws otherwise). Instead resolve tuple_value ourselves
-    # and short-circuit to it directly when it's no longer a tuple.
+    # visit_call_ retypes the call, and this mutator's base var-remap then automatically
+    # propagates that new type onto any bound Var before visit_tuple_getitem_ sees it. So by the
+    # time visit_tuple_getitem_ resolves tuple_value, it may already be a plain tensor-typed var
+    # rather than a tuple. We can't call super().visit_tuple_getitem_() here, since it assumes
+    # tuple_value stays a TupleType and throws otherwise. Instead we resolve tuple_value
+    # ourselves and short-circuit to it directly once it's no longer a tuple.
     @mutator
     class _CallSiteFixer(relax.PyExprMutator):
         def visit_call_(self, call: relax.Call):
@@ -593,156 +720,100 @@ class ResNetV1Rewrite:
         return mod
 
 
-def partition_for_dnnl(
-    mod: tvm.IRModule,
-    params: dict[str, tvm.runtime.Tensor] | None = None,
-    alter_layout: bool = True,
-    prune_subgraphs: bool = True,
-    run_codegen: bool = True,
-) -> tvm.IRModule:
-    # Apply the downsample rewrite before any partitioning begins
-    mod = ResNetV1Rewrite()(mod)
+def rewrite_pad_avg_pool2d(mod: tvm.IRModule) -> tvm.IRModule:
+    """Folds a directly-preceding constant zero-pad into avg_pool2d's own padding attribute.
 
-    if params:
-        mod = relax.transform.BindParams("main", params)(mod)
+    This only happens when all of the following hold:
+      - the pad is a constant pad of value 0.0
+      - pad widths on the N and C axes are 0, meaning the padding is spatial only
+      - avg_pool2d doesn't already carry non-zero padding of its own
+      - the pad has exactly one consumer, this avg_pool2d call, since removing it otherwise
+        would change another consumer's input
 
-    pre_seq = tvm.transform.Sequential(
-        [
-            relax.transform.DecomposeOpsForInference(),
-            relax.transform.FoldConstant(),
-            relax.transform.FoldBatchnormToConv2D(),
-            relax.transform.CanonicalizeBindings(),
-            relax.transform.EliminateCommonSubexpr(),
-            relax.transform.FoldConstant(),
-        ]
-    )
-    with tvm.transform.PassContext(opt_level=3):
-        mod = pre_seq(mod)
+    Pad and avg_pool2d pairs that don't match these conditions are left alone and simply run as
+    two separate, non-offloaded ops. That's still correct, just not fused, and this pass never
+    guesses.
 
-    if alter_layout:
-        desired_layouts = {
-            "relax.nn.conv2d": ["NCHW", "OIHW"],
-            "relax.nn.conv2d_transpose": ["NCHW", "OIHW"],
-            "relax.nn.conv3d": ["NCDHW", "OIDHW"],
-            "relax.nn.conv3d_transpose": ["NCDHW", "OIDHW"],
-        }
-        with tvm.transform.PassContext(opt_level=3):
-            mod = relax.transform.ConvertLayout(desired_layouts)(mod)
-            mod = relax.transform.FoldConstant()(mod)
+    The pad_width indexing below assumes NCHW axis order, matching avg_pool2d's default layout
+    attr. An NHWC layout would need different axis indices, which this doesn't handle yet.
+    """
+    data_pat = wildcard()
+    pad_pat = is_op("relax.nn.pad")(data_pat)
+    pool_pat = is_op("relax.nn.avg_pool2d")(pad_pat)
 
-    mod = rewrite_layer_norm(mod)
-    mod = rewrite_dense_bias_gelu_reshape_last(mod)
-    mod = rewrite_batch_norm(mod)
+    def _checked_rewriter(func: relax.Function):
+        # Count consumers of each var so we can reject fan-out pads.
+        use_count: dict[int, int] = {}
 
-    dnnl_patterns = _ordered_dnnl_patterns()
+        @visitor
+        class _UseCounter(relax.PyExprVisitor):
+            def visit_var_(self, var):
+                use_count[id(var)] = use_count.get(id(var), 0) + 1
 
-    byoc_seq = tvm.transform.Sequential(
-        [
-            FuseOpsByPattern(dnnl_patterns, annotate_codegen=True),
-            MergeCompositeFunctions(),
-        ]
-    )
-    with tvm.transform.PassContext(opt_level=3):
-        mod = byoc_seq(mod)
+        _UseCounter().visit_expr(func)
 
-    mod = _unwrap_batch_norm_tuple_output(mod)
+        def rewriter(expr, matches):
+            pad_call = matches[pad_pat]
+            pool_call = matches[pool_pat]
+            data = matches[data_pat]
 
-    if prune_subgraphs:
-        mod = prune_dnnl_subgraphs(mod)
+            pad_attrs = pad_call.attrs
+            pool_attrs = pool_call.attrs
 
-    if run_codegen:
-        with tvm.transform.PassContext(opt_level=3):
-            mod = relax.transform.RunCodegen()(mod)
+            # 1) pad value must be exactly 0, mode must be constant.
+            if str(pad_attrs.pad_mode) != "constant":
+                return expr
+            pad_value = float(pad_attrs.pad_value)
+            if pad_value != 0.0:
+                return expr
 
-    return mod
+            # 2) pad_width is a flat list of (before, after) per axis, NCHW order assumed.
+            pad_width = [int(v) for v in pad_attrs.pad_width]
 
+            # pad_width is stored as (before, after) pairs: axis 0 is N, axis 1 is C, axes 2
+            # and 3 are H and W.
+            n_before, n_after = pad_width[0], pad_width[1]
+            c_before, c_after = pad_width[2], pad_width[3]
+            h_before, h_after = pad_width[4], pad_width[5]
+            w_before, w_after = pad_width[6], pad_width[7]
+            if (n_before, n_after, c_before, c_after) != (0, 0, 0, 0):
+                return expr  # never fold padding on the batch or channel axes
 
-_DNNL_COMPUTE_OPS = {
-    "relax.nn.conv1d",
-    "relax.nn.conv2d",
-    "relax.nn.conv3d",
-    "relax.nn.conv2d_transpose",
-    "relax.nn.conv3d_transpose",
-    "relax.matmul",
-    "relax.nn.batch_matmul",
-    "relax.nn.layer_norm",
-    # Standalone ops: for these, the op itself IS what DNNL dispatches on, so
-    # a subgraph containing only one of these is not "trivial" the way e.g. a
-    # lone leftover bias-add would be. Without these, every standalone
-    # composite gets demoted by prune_dnnl_subgraphs even though the
-    # composite/codegen promotion worked correctly.
-    "relax.abs",
-    "relax.exp",
-    "relax.log",
-    "relax.sqrt",
-    "relax.round",
-    "relax.tanh",
-    "relax.sigmoid",
-    "relax.clip",
-    "relax.nn.adaptive_avg_pool2d",
-    "relax.nn.max_pool1d",
-    "relax.nn.max_pool2d",
-    "relax.nn.max_pool3d",
-    "relax.nn.avg_pool1d",
-    "relax.nn.avg_pool2d",
-    "relax.nn.avg_pool3d",
-    "relax.nn.softmax",
-    "relax.nn.batch_norm",
-}
+            # 3) avg_pool2d must not already have non-zero padding.
+            existing_padding = [int(v) for v in pool_attrs.padding]
+            if any(p != 0 for p in existing_padding):
+                return expr
 
+            # 4) pad must have a single consumer, this pool call.
+            padded_arg = pool_call.args[0]
+            if not isinstance(padded_arg, relax.Var) or use_count.get(id(padded_arg), 0) > 1:
+                return expr
 
-def _count_compute_ops(mod: tvm.IRModule, func: relax.Function) -> int:
-    count = 0
-    seen_globals = set()
+            merged_padding = [h_before, w_before, h_after, w_after]  # top, left, bottom, right
 
-    @visitor
-    class _Counter(relax.PyExprVisitor):
-        def visit_call_(self, call: relax.Call):
-            nonlocal count
-            if isinstance(call.op, tvm.ir.Op) and call.op.name in _DNNL_COMPUTE_OPS:
-                count += 1
-            elif isinstance(call.op, relax.GlobalVar):
-                gv = call.op
-                if gv not in seen_globals and gv in mod.functions:
-                    seen_globals.add(gv)
-                    self.visit_expr(mod[gv])
-            super().visit_call_(call)
+            return relax.op.nn.avg_pool2d(
+                data,
+                pool_size=pool_attrs.pool_size,
+                strides=pool_attrs.strides,
+                padding=merged_padding,
+                dilation=pool_attrs.dilation,
+                ceil_mode=pool_attrs.ceil_mode,
+                count_include_pad=True,
+                layout=pool_attrs.layout,
+                out_layout=pool_attrs.out_layout,
+            )
 
-    _Counter().visit_expr(func)
-    return count
+        return rewriter
 
-
-def prune_dnnl_subgraphs(mod: tvm.IRModule) -> tvm.IRModule:
-    to_demote = []
+    new_mod = tvm.IRModule(mod.functions)
     for gvar, func in mod.functions.items():
-        if not isinstance(func, relax.Function):
-            continue
-        if func.attrs is None or func.attrs.get("Codegen") != "dnnl":
-            continue
-        if _count_compute_ops(mod, func) == 0:
-            to_demote.append(gvar)
-
-    if not to_demote:
-        return mod
-
-    new_mod = mod.clone() if hasattr(mod, "clone") else tvm.IRModule(mod.functions)
-    for gvar in to_demote:
-        func = new_mod[gvar]
-        if func.attrs is not None and "Codegen" in func.attrs:
-            func = func.without_attr("Codegen")
-        if func.attrs is not None and "global_symbol" in func.attrs:
-            func = func.without_attr("global_symbol")
-        new_mod[gvar] = func
-
-    with tvm.transform.PassContext(opt_level=3):
-        new_mod = relax.transform.InlinePrivateFunctions()(new_mod)
-        new_mod = relax.transform.DeadCodeElimination(["main"])(new_mod)
-
+        if isinstance(func, relax.Function):
+            new_mod[gvar] = rewrite_call(pool_pat, _checked_rewriter(func), func)
     return new_mod
 
 
 def rewrite_layer_norm(mod: tvm.IRModule) -> tvm.IRModule:
-    """Rewrite multiple operators into a TVM native layer normalization."""
+    """Rewrites multiple operators into a TVM native layer normalization."""
     data_pat = wildcard()
     gamma_pat = wildcard()
     beta_pat = wildcard()
@@ -776,14 +847,14 @@ def rewrite_layer_norm(mod: tvm.IRModule) -> tvm.IRModule:
 
 
 def rewrite_batch_norm(mod: tvm.IRModule) -> tvm.IRModule:
-    """Rewrite the decomposed batch_norm primitive chain (produced by
-    DecomposeOpsForInference) back into a single relax.nn.batch_norm call.
+    """Rewrites the decomposed batch_norm primitive chain, produced by
+    DecomposeOpsForInference, back into a single relax.nn.batch_norm call.
 
-    Decomposed shape:
+    The decomposed shape is:
         (x - mean) / sqrt(var + eps) * gamma + beta
-    with mean/var/gamma/beta each pre-broadcast via expand_dims([0, 2, 3])
-    (i.e. NCHW, channel axis = 1). Without this rewrite, no batch_norm call
-    survives for the dnnl.batch_norm standalone pattern to match against.
+    with mean, var, gamma, and beta each pre-broadcast via expand_dims([0, 2, 3]), i.e. NCHW with
+    channel axis 1. Without this rewrite, no batch_norm call survives for the dnnl.batch_norm
+    standalone pattern to match against.
     """
     x_pat = wildcard()
     mean_pat = wildcard()
@@ -825,7 +896,7 @@ def rewrite_batch_norm(mod: tvm.IRModule) -> tvm.IRModule:
 
 
 def rewrite_dense_bias_gelu_reshape_last(mod: tvm.IRModule) -> tvm.IRModule:
-    """Reorder reshape operators for dense_bias_gelu/dense_bias fusion."""
+    """Reorders reshape operators for dense_bias_gelu and dense_bias fusion."""
 
     def _apply(func: relax.Function, has_gelu: bool) -> relax.Function:
         data_pat = wildcard()
@@ -883,5 +954,292 @@ def rewrite_dense_bias_gelu_reshape_last(mod: tvm.IRModule) -> tvm.IRModule:
             f1 = _apply(func, has_gelu=True)
             f2 = _apply(f1, has_gelu=False)
             new_mod[gvar] = f2
+
+    return new_mod
+
+
+# QNN legalization
+
+
+def _try_fold_qdq_constant(q_expr, scale_expr, zp_expr) -> np.ndarray | None:
+    """If q, scale, and zp are all compile-time relax.Constant values and scale/zp are per-tensor
+    (size 1), returns the dequantized float32 numpy array. Otherwise returns None, and the caller
+    should leave the chain alone rather than guess. Shared by weight-folding and opportunistic
+    bias-folding below.
+    """
+    if not (
+        isinstance(q_expr, relax.Constant)
+        and isinstance(scale_expr, relax.Constant)
+        and isinstance(zp_expr, relax.Constant)
+    ):
+        return None
+
+    q_np = q_expr.data.numpy()
+    scale_np = scale_expr.data.numpy().astype("float32")
+    zp_np = zp_expr.data.numpy().astype("float32")
+
+    if scale_np.size != 1 or zp_np.size != 1:
+        return None
+
+    return scale_np * (q_np.astype("float32") - zp_np)
+
+
+def _try_requantize_consts(
+    out_scale_expr, out_zp_expr
+) -> tuple[relax.Constant, relax.Constant] | None:
+    if not (isinstance(out_scale_expr, relax.Constant) and isinstance(out_zp_expr, relax.Constant)):
+        return None
+
+    out_scale_np = out_scale_expr.data.numpy().astype("float32")
+    out_zp_np = out_zp_expr.data.numpy()
+
+    if out_scale_np.size != 1 or out_zp_np.size != 1:
+        return None
+
+    # Output scale must be floating point.
+    dq_scale_np = 1.0 / out_scale_np
+
+    # Relax's dequantize doesn't accept a float32 zero point, so for now this only supports
+    # zero_point equal to 0.
+    if float(out_zp_np.reshape(-1)[0]) != 0.0:
+        return None
+
+    dq_zp_np = np.array(0, dtype="int32")
+
+    return (
+        relax.const(dq_scale_np, "float32"),
+        relax.const(dq_zp_np, "int32"),
+    )
+
+
+def legalize_qnn_op_for_dnnl(mod: tvm.IRModule) -> tvm.IRModule:
+    """LegalizeQnnOpForDnnl rewrites a quantized conv2d/matmul chain:
+
+        dequantize(data_q) and dequantize(weight_q)
+            -> nn.conv2d/matmul
+            -> [add(bias)]                        # optional: "qnn.conv2d/qnn.dense + bias"
+            -> quantize(out, out_scale, out_zp)    # the "+ requantize" step. Relax has no
+                                                    # dedicated requantize op, so this is how the
+                                                    # "qnn.conv2d + bias + requantize" chain is
+                                                    # actually spelled in Relax's QDQ-only IR.
+
+    It does three things:
+
+      1. Folds the weight-side dequantize to a float32 constant whenever it's compile-time
+         foldable.
+      2. Leaves the bias, if present, as a plain add. It opportunistically folds it to a float32
+         constant too when it happens to also be a compile-time dequantize(int32_const, ...)
+         chain, the common shape for a real quantized bias where scale is data_scale times
+         weight_scale. Anything else, whether already float or a dynamic Var, passes through
+         untouched, since make_fused_bias_activation_pattern's bias slot is a bare wildcard and
+         either form already matches dnnl.conv2d_bias or dnnl.matmul_bias with no further
+         rewriting needed.
+      3. Rewrites the terminal quantize(out, out_scale, out_zp) into the algebraically equivalent
+         dequantize(out, scale', zp'), so downstream pattern matching only ever needs to
+         recognize one terminal-node shape, the same one make_qnn_conv2d_pattern and
+         make_qnn_dense_pattern already look for. See _try_requantize_consts() for the exact
+         derivation and its rounding-mode caveat.
+
+    The data-side dequantize is deliberately left untouched, same as before: whatever consumes
+    the legalized chain treats data and weight as opaque wildcards, so it doesn't matter whether
+    the data-side dequantize has been folded or still runs standalone ahead of the offloaded
+    region.
+    """
+    data_q = wildcard()
+    weight_q = wildcard()
+    data_scale, data_zp = wildcard(), wildcard()
+    weight_scale, weight_zp = wildcard(), wildcard()
+    bias = wildcard()
+    out_scale = is_const()
+    out_zp = is_const()
+
+    dq_data = is_op("relax.dequantize")(data_q, data_scale, data_zp)
+    dq_weight = is_op("relax.dequantize")(weight_q, weight_scale, weight_zp)
+
+    def _make_rewriter(op_out_pat, has_bias: bool):
+        def rewriter(expr, matches):
+            # expr is the matched root, the terminal relax.quantize(...) call.
+            weight_np = _try_fold_qdq_constant(
+                matches[weight_q], matches[weight_scale], matches[weight_zp]
+            )
+            if weight_np is None:
+                return expr  # weight isn't compile-time-foldable, so leave the chain alone
+
+            requant_consts = _try_requantize_consts(matches[out_scale], matches[out_zp])
+            if requant_consts is None:
+                return expr  # requantize params aren't compile-time constants, leave it alone
+            dq_scale_const, dq_zp_const = requant_consts
+
+            op_call = matches[op_out_pat]
+            new_weight = relax.const(weight_np, "float32")
+            new_op_call = relax.Call(
+                op_call.op, [matches[dq_data], new_weight], attrs=op_call.attrs
+            )
+
+            if has_bias:
+                bias_expr = matches[bias]
+                # Fold the bias opportunistically, only when it's itself a fully-constant
+                # dequantize(...) chain. Anything else passes through unchanged.
+                if (
+                    isinstance(bias_expr, relax.Call)
+                    and isinstance(bias_expr.op, tvm.ir.Op)
+                    and bias_expr.op.name == "relax.dequantize"
+                    and len(bias_expr.args) == 3
+                ):
+                    bias_np = _try_fold_qdq_constant(*bias_expr.args)
+                    if bias_np is not None:
+                        bias_expr = relax.const(bias_np, "float32")
+                new_inner = relax.op.add(new_op_call, bias_expr)
+            else:
+                new_inner = new_op_call
+
+            return relax.op.dequantize(
+                new_inner,
+                dq_scale_const,
+                dq_zp_const,
+                axis=expr.attrs.axis,
+                out_dtype="float32",
+            )
+
+        return rewriter
+
+    new_mod = tvm.IRModule(mod.functions)
+    for gvar, func in mod.functions.items():
+        if not isinstance(func, relax.Function):
+            continue
+
+        f = func
+        for op_name in ("relax.nn.conv2d", "relax.matmul"):
+            op_out = is_op(op_name)(dq_data, dq_weight)
+            biased = is_op("relax.add")(op_out, bias)
+
+            root_no_bias = is_op("relax.quantize")(op_out, out_scale, out_zp)
+            root_bias = is_op("relax.quantize")(biased, out_scale, out_zp)
+
+            f = rewrite_call(root_no_bias, _make_rewriter(op_out, has_bias=False), f)
+            f = rewrite_call(root_bias, _make_rewriter(op_out, has_bias=True), f)
+
+        new_mod[gvar] = f
+    return new_mod
+
+
+# Partitioning entry point
+
+
+def partition_for_dnnl(
+    mod: tvm.IRModule,
+    params: dict[str, tvm.runtime.Tensor] | None = None,
+    alter_layout: bool = True,
+    prune_subgraphs: bool = True,
+    run_codegen: bool = True,
+) -> tvm.IRModule:
+    # Apply the downsample rewrite before any partitioning begins.
+    mod = ResNetV1Rewrite()(mod)
+
+    if params:
+        mod = relax.transform.BindParams("main", params)(mod)
+
+    pre_seq = tvm.transform.Sequential(
+        [
+            relax.transform.DecomposeOpsForInference(),
+            relax.transform.FoldConstant(),
+            relax.transform.FoldBatchnormToConv2D(),
+            relax.transform.CanonicalizeBindings(),
+            relax.transform.EliminateCommonSubexpr(),
+            relax.transform.FoldConstant(),
+        ]
+    )
+    with tvm.transform.PassContext(opt_level=3):
+        mod = pre_seq(mod)
+
+    if alter_layout:
+        # This is derived entirely from _CONV_LAYOUT_QUERY_SPECS, the single source of truth for
+        # conv layouts, including the IO-swapped kernel layout for the transpose variants.
+        desired_layouts = {
+            op_name: default_layout
+            for op_name, (_rank, _is_transpose, default_layout) in _CONV_LAYOUT_QUERY_SPECS.items()
+        }
+        with tvm.transform.PassContext(opt_level=3):
+            mod = relax.transform.ConvertLayout(desired_layouts)(mod)
+            mod = relax.transform.FoldConstant()(mod)
+
+    mod = rewrite_layer_norm(mod)
+    mod = rewrite_dense_bias_gelu_reshape_last(mod)
+    mod = rewrite_batch_norm(mod)
+    mod = rewrite_pad_avg_pool2d(mod)
+    mod = legalize_qnn_op_for_dnnl(mod)
+    mod = relax.transform.FoldConstant()(mod)
+
+    dnnl_patterns = _ordered_dnnl_patterns()
+    byoc_seq = tvm.transform.Sequential(
+        [
+            FuseOpsByPattern(dnnl_patterns, annotate_codegen=True),
+            MergeCompositeFunctions(),
+        ]
+    )
+    with tvm.transform.PassContext(opt_level=3):
+        mod = byoc_seq(mod)
+
+    mod = _unwrap_batch_norm_tuple_output(mod)
+
+    if prune_subgraphs:
+        mod = prune_dnnl_subgraphs(mod)
+
+    if run_codegen:
+        with tvm.transform.PassContext(opt_level=3):
+            mod = relax.transform.RunCodegen()(mod)
+
+    return mod
+
+
+# Subgraph pruning
+
+
+def _count_compute_ops(mod: tvm.IRModule, func: relax.Function) -> int:
+    count = 0
+    seen_globals: set = set()
+
+    @visitor
+    class _Counter(relax.PyExprVisitor):
+        def visit_call_(self, call: relax.Call):
+            nonlocal count
+            if isinstance(call.op, tvm.ir.Op) and call.op.name in _DNNL_COMPUTE_OPS:
+                count += 1
+            elif isinstance(call.op, relax.GlobalVar) and call.op not in seen_globals:
+                gv = call.op
+                seen_globals.add(gv)
+                if gv in mod.functions:
+                    self.visit_expr(mod[gv])
+            super().visit_call_(call)
+
+    _Counter().visit_expr(func)
+    return count
+
+
+def prune_dnnl_subgraphs(mod: tvm.IRModule) -> tvm.IRModule:
+    to_demote = []
+    for gvar, func in mod.functions.items():
+        if not isinstance(func, relax.Function):
+            continue
+        if func.attrs is None or func.attrs.get("Codegen") != "dnnl":
+            continue
+        if _count_compute_ops(mod, func) == 0:
+            to_demote.append(gvar)
+
+    if not to_demote:
+        return mod
+
+    new_mod = mod.clone() if hasattr(mod, "clone") else tvm.IRModule(mod.functions)
+    for gvar in to_demote:
+        func = new_mod[gvar]
+        if func.attrs is not None and "Codegen" in func.attrs:
+            func = func.without_attr("Codegen")
+        if func.attrs is not None and "global_symbol" in func.attrs:
+            func = func.without_attr("global_symbol")
+        new_mod[gvar] = func
+
+    with tvm.transform.PassContext(opt_level=3):
+        new_mod = relax.transform.InlinePrivateFunctions()(new_mod)
+        new_mod = relax.transform.DeadCodeElimination(["main"])(new_mod)
 
     return new_mod

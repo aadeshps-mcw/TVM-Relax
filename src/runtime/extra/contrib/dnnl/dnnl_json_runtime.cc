@@ -169,6 +169,13 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     auto o_scl_tr = GetInputByName(nid, "o_scl_idx");
     auto sum_scl_tr = GetInputByName(nid, "sum_scl_idx");
 
+    if (o_scl_tr) {
+      TVM_FFI_ICHECK(o_scl_tr.IsConstant());
+      auto data = o_scl_tr.GetConstDataLikeVec<float>();
+      attr.set_scales_mask(DNNL_ARG_DST, data.size() == 1 ? 0 : (1 << 1));
+      *o_scl_tr_out = o_scl_tr;
+    }
+
     auto activation = GetNodeAttr<std::vector<std::string>>(nodes_[nid], "activation", {"none"});
     if (activation[0] != "none") {
       TVM_FFI_ICHECK(elt_name2algo.count(activation[0]))
@@ -266,7 +273,7 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
 
     *bias_tr = GetInputByName(nid, "bias_idx");
 
-    if (o_scl_tr || activation[0] != "none" || sum_scl_tr || dst_zp_tr) return attr;
+    if (activation[0] != "none" || sum_scl_tr || dst_zp_tr) return attr;
 
     auto op_name = nodes_[nid].GetOpName();
     dnnl::post_ops ops;
@@ -316,6 +323,8 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
           Dense(nid);
         } else if ("batch_norm" == stripped_op_name) {
           BatchNorm(nid);
+        } else if (contains(op_name, "global_avg_pool2d")) {
+          GlobalAvgPooling(nid);
         } else if (contains_any(op_name, "max_pool1d", "max_pool2d", "max_pool3d")) {
           Pooling(nid, dnnl::algorithm::pooling_max);
         } else if (contains_any(op_name, "avg_pool1d", "avg_pool2d", "avg_pool3d")) {
@@ -473,7 +482,6 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     if (dst_layout.empty()) dst_layout = src_layout;
 
     for (auto& d : dilates) d--;
-
     src_tr = src_tr.TreatAs(src_layout);
     dst_tr = dst_tr.TreatAs(dst_layout);
     wgh_tr = wgh_tr.TreatAs(wgh_layout);
@@ -506,11 +514,13 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
 
     auto scratchpad_tr = TensorRequisite::AsIs(deconv_prim_desc.scratchpad_desc());
 
-    Submit(dnnl::deconvolution_forward(deconv_prim_desc), {{DNNL_ARG_SRC, src_tr},
-                                                           {DNNL_ARG_WEIGHTS, wgh_tr},
-                                                           {DNNL_ARG_BIAS, bias_tr},
-                                                           {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
-                                                           {DNNL_ARG_DST, dst_tr}});
+    Submit(dnnl::deconvolution_forward(deconv_prim_desc),
+           {{DNNL_ARG_SRC, src_tr},
+            {DNNL_ARG_WEIGHTS, wgh_tr},
+            {DNNL_ARG_BIAS, bias_tr},
+            {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
+            {DNNL_ARG_DST, dst_tr},
+            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, o_scl_tr}});
   }
 
   void Dense(const size_t& nid) {
@@ -556,11 +566,15 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
             {DNNL_ARG_WEIGHTS, wgh_tr},
             {DNNL_ARG_BIAS, bias_tr},
             {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
-            {DNNL_ARG_DST, dst_tr}},
+            {DNNL_ARG_DST, dst_tr},
+            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, o_scl_tr}},
            {sum_in_tr, DNNL_ARG_DST});
   }
 
   void MatMul(const size_t& nid) {
+    auto node = nodes_[nid];
+    auto op_name = node.GetOpName();
+
     auto src_tr = GetInput(nid, 0);
     auto wgh_tr = GetInput(nid, 1);
     auto dst_tr = GetOutput(nid, 0);
@@ -573,7 +587,7 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
 
     if (bias_tr.defined()) {
       // oneDNN's matmul primitive (unlike inner_product) requires the bias's
-      // dimension *count* to match dst's rank -- broadcastable size-1 dims
+      // dimension count to match dst's rank -- broadcastable size-1 dims
       // are fine, a smaller rank is not. Reshape (n,) -> (1, ..., 1, n).
       auto dst_dims = dst_tr.dims();
       std::vector<int64_t> bias_dims(dst_dims.size(), 1);
@@ -597,11 +611,18 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
 
     auto scratchpad_tr = TensorRequisite::AsIs(matmul_prim_desc.scratchpad_desc());
 
-    Submit(dnnl::matmul(matmul_prim_desc), {{DNNL_ARG_SRC, src_tr},
-                                            {DNNL_ARG_WEIGHTS, wgh_tr},
-                                            {DNNL_ARG_BIAS, bias_tr},
-                                            {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
-                                            {DNNL_ARG_DST, dst_tr}});
+    auto sum_in_tr = GetInputByName(nid, "sum_idx");
+    if (op_name.find("_sum") != std::string::npos) {
+      sum_in_tr = GetInput(nid, node.GetInputs().size() - 1);
+    }
+
+    Submit(dnnl::matmul(matmul_prim_desc),
+           {{DNNL_ARG_SRC, src_tr},
+            {DNNL_ARG_WEIGHTS, wgh_tr},
+            {DNNL_ARG_BIAS, bias_tr},
+            {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
+            {DNNL_ARG_DST, dst_tr}},
+           {sum_in_tr, DNNL_ARG_DST});
   }
 
   void BatchMatMul(const size_t& nid) {
@@ -730,54 +751,61 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
                                                                 {DNNL_ARG_SHIFT, beta_tr}});
   }
 
-  void Pooling(const size_t& nid, dnnl::algorithm algo) {
+  void GlobalAvgPooling(const size_t& nid) {
     auto node = nodes_[nid];
-    auto op_name = node.GetOpName();
-    bool is_global = op_name.find("global") != std::string::npos;
 
     auto src_tr = GetInput(nid, 0);
     auto dst_tr = GetOutput(nid, 0);
 
-    // Get layout.
     auto src_layout = GetNodeAttr<std::string>(node, "layout");
     auto dst_layout = GetNodeAttr<std::string>(node, "out_layout");
-
-    // dst_layout == "" means to use data_layout
     if (dst_layout.empty()) dst_layout = src_layout;
 
-    // Take into account provided layout strings
+    src_tr = src_tr.TreatAs(src_layout);
+    dst_tr = dst_tr.TreatAs(dst_layout);
+    auto src_dims = src_tr.dims();
+    TVM_FFI_ICHECK_GT(src_dims.size(), 2U) << "Expected at least one spatial dimension";
+    std::vector<int64_t> kernel(src_dims.begin() + 2, src_dims.end());
+    std::vector<int64_t> strides(kernel.size(), 1);
+    std::vector<int64_t> dilates(kernel.size(), 0);
+    std::vector<int64_t> padding_l(kernel.size(), 0);
+    std::vector<int64_t> padding_r(kernel.size(), 0);
+
+    auto pool_prim_desc = dnnl::pooling_forward::primitive_desc(
+        engine_, dnnl::prop_kind::forward_inference, dnnl::algorithm::pooling_avg_exclude_padding,
+        src_tr.desc(), dst_tr.LayoutAny().desc(), strides, kernel, dilates, padding_l, padding_r);
+
+    src_tr = src_tr.RequestLayout(pool_prim_desc.src_desc());
+    dst_tr = dst_tr.RequestLayout(pool_prim_desc.dst_desc());
+    auto scratchpad_tr = TensorRequisite::AsIs(pool_prim_desc.scratchpad_desc());
+
+    Submit(dnnl::pooling_forward(pool_prim_desc),
+           {{DNNL_ARG_SRC, src_tr}, {DNNL_ARG_DST, dst_tr}, {DNNL_ARG_SCRATCHPAD, scratchpad_tr}});
+  }
+
+  void Pooling(const size_t& nid, dnnl::algorithm algo) {
+    auto node = nodes_[nid];
+
+    auto src_tr = GetInput(nid, 0);
+    auto dst_tr = GetOutput(nid, 0);
+
+    auto src_layout = GetNodeAttr<std::string>(node, "layout");
+    auto dst_layout = GetNodeAttr<std::string>(node, "out_layout");
+    if (dst_layout.empty()) dst_layout = src_layout;
+
     src_tr = src_tr.TreatAs(src_layout);
     dst_tr = dst_tr.TreatAs(dst_layout);
 
-    TVM_FFI_ICHECK(src_tr.dims().size() > 2);
+    auto kernel = GetNodeAttr<std::vector<int64_t>>(node, "pool_size");
+    auto strides = GetNodeAttr<std::vector<int64_t>>(node, "strides");
+    auto dilates = GetNodeAttr<std::vector<int64_t>>(node, "dilation");
+    auto padding = GetNodeAttr<std::vector<int64_t>>(node, "padding");
 
-    std::vector<int64_t> feature_size;
-    for (size_t i = 2; i < src_tr.dims().size(); i++) {
-      feature_size.push_back(int64_t(src_tr.dims()[i]));
-    }
-
-    // Set attributes.
-    auto kernel = is_global ? feature_size : GetNodeAttr<std::vector<int64_t>>(node, "pool_size");
-    auto strides = is_global ? std::vector<int64_t>(src_tr.dims().size() - 2, 1)
-                             : GetNodeAttr<std::vector<int64_t>>(node, "strides");
-    auto dilates = is_global ? std::vector<int64_t>(src_tr.dims().size() - 2, 1)
-                             : GetNodeAttr<std::vector<int64_t>>(node, "dilation");
-    auto padding = is_global ? std::vector<int64_t>((src_tr.dims().size() - 2) * 2, 0)
-                             : GetNodeAttr<std::vector<int64_t>>(node, "padding");
     std::vector<int64_t> padding_l(padding.begin(), padding.begin() + padding.size() / 2);
     std::vector<int64_t> padding_r(padding.begin() + padding.size() / 2, padding.end());
 
-    // Minus one for DNNL representation. No dilation for DNNL is 0
-    for (auto& d : dilates) d--;
-
-    // Attributes related to AvgPool
-    // Replace the if(!is_global) block and descriptors with:
-    if (!is_global && (algo == dnnl::algorithm::pooling_avg_exclude_padding ||
-                       algo == dnnl::algorithm::pooling_avg_include_padding)) {
-      auto include_pad = GetNodeAttr<bool>(node, "count_include_pad");
-      algo = include_pad ? dnnl::algorithm::pooling_avg_include_padding
-                         : dnnl::algorithm::pooling_avg_exclude_padding;
-    }
+    for (auto& d : dilates)
+      d--;  // No dilation for DNNL is 0, Relax's is 1 -- same as Convolution().
 
     auto pool_prim_desc = dnnl::pooling_forward::primitive_desc(
         engine_, dnnl::prop_kind::forward_inference, algo, src_tr.desc(), dst_tr.LayoutAny().desc(),
@@ -785,7 +813,6 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
 
     src_tr = src_tr.RequestLayout(pool_prim_desc.src_desc());
     dst_tr = dst_tr.RequestLayout(pool_prim_desc.dst_desc());
-
     auto scratchpad_tr = TensorRequisite::AsIs(pool_prim_desc.scratchpad_desc());
 
     Submit(dnnl::pooling_forward(pool_prim_desc),

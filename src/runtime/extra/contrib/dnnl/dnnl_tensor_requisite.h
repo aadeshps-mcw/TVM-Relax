@@ -26,6 +26,7 @@
 #define TVM_RUNTIME_CONTRIB_DNNL_DNNL_TENSOR_REQUISITE_H_
 
 #include <dlpack/dlpack.h>
+#include <dnnl_debug.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -184,18 +185,19 @@ class TensorRequisite {
     auto one_filled = dnnl::memory::dims(shape.size() - extended_dims.size(), 1);
     extended_dims.insert(extended_dims.begin(), one_filled.begin(), one_filled.end());
     auto reshaped = t_desc_.reshape(extended_dims);
+    auto dims = reshaped.get_dims();
     auto padded_dims = reshaped.get_padded_dims();
     auto strides = reshaped.get_strides();
     for (size_t i = 0; i < extended_dims.size(); i++) {
       if (extended_dims[i] == shape[i]) continue;
       TVM_FFI_ICHECK_EQ(extended_dims[i], 1);
-      // A broadcast dim must not carry any block padding, or a zero-stride reinterpretation
-      // would silently read/write the wrong elements.
-      TVM_FFI_ICHECK_EQ(extended_dims[i], padded_dims[i]);
-      strides[i] = 0;  // zero-stride broadcast dim
-    }
-    auto desc = dnnl::memory::desc(shape, t_desc_.get_data_type(), strides);
+      TVM_FFI_ICHECK_EQ(dims[i], padded_dims[i]);
 
+      dims[i] = shape[i];
+      padded_dims[i] = shape[i];
+      strides[i] = 0;
+    }
+    auto desc = dnnl::memory::desc(dims, t_desc_.get_data_type(), strides);
     // reinterpret memory buffer with new strides
     return {desc, orig, true, {}, kUndefinedTid, reverse_data_flow_};
   }
@@ -309,6 +311,52 @@ class TensorRequisite {
     return wgh_tr;
   }
 
+  static const std::unordered_map<std::string, dnnl::memory::format_tag>&
+  FormatTagsByCanonicalName() {
+    static const std::unordered_map<std::string, dnnl::memory::format_tag> table = [] {
+      std::unordered_map<std::string, dnnl::memory::format_tag> m;
+      for (int v = static_cast<int>(dnnl::memory::format_tag::a);
+           v < static_cast<int>(dnnl_format_tag_last); ++v) {
+        const char* name = dnnl_fmt_tag2str(static_cast<dnnl_format_tag_t>(v));
+        if (name == nullptr || name[0] == '\0') continue;
+        m.emplace(std::string(name), static_cast<dnnl::memory::format_tag>(v));
+      }
+      // Sanity net: if dnnl_fmt_tag2str ever behaves unexpectedly (returns nothing
+      // usable, or the loop bound is wrong for some future oneDNN ABI change),
+      // fail loudly at first use instead of silently degrading into "every
+      // TreatAs() call throws not-found" with no clue why.
+      TVM_FFI_ICHECK_GT(m.size(), 100u)
+          << "oneDNN format_tag introspection returned suspiciously few tags (" << m.size()
+          << "). dnnl_fmt_tag2str()/dnnl_format_tag_last may not be "
+             "behaving as expected for this oneDNN build.";
+      return m;
+    }();
+    return table;
+  }
+
+  static std::string CanonicalFormatTagName(const std::vector<std::pair<int, char>>& layout_tokens,
+                                            int rank,
+                                            const std::map<char, int>& dim_position_by_tag) {
+    std::set<char> blocked_semantic_letters;
+    for (size_t i = static_cast<size_t>(rank); i < layout_tokens.size(); i++)
+      blocked_semantic_letters.insert(layout_tokens[i].second);
+
+    std::string canonical;
+    for (size_t i = 0; i < layout_tokens.size(); i++) {
+      const auto& token = layout_tokens[i];
+      char abstract_letter = static_cast<char>('a' + dim_position_by_tag.at(token.second));
+      if (i < static_cast<size_t>(rank)) {
+        canonical += blocked_semantic_letters.count(token.second)
+                         ? static_cast<char>(std::toupper(abstract_letter))
+                         : abstract_letter;
+      } else {
+        canonical += std::to_string(token.first);
+        canonical += abstract_letter;
+      }
+    }
+    return canonical;
+  }
+
   /*!
    * \brief Treat TR shape as described in layout string.
    *
@@ -338,11 +386,11 @@ class TensorRequisite {
     if (!defined()) return *this;
     if (desired_logic_layout.empty()) desired_logic_layout = DefaultLogicLayoutFor(layout);
 
-    // origin_dims is the *physical* shape of the tensor as currently stored, e.g. for a
-    // blocked layout like "ABCD8b" this is 5D: {A, B/8, C, D, 8}.
+    // Physical shape of the tensor as currently stored, e.g. for "ABCD8b" this is
+    // 5D: {A, B/8, C, D, 8}.
     const auto origin_dims = dims();
 
-    // split layout string to tokens {size, tag} like {16, 'C'}, {4, 'O'}
+    // Split layout string into tokens {size, tag}, e.g. {-1,'N'}, {8,'C'}.
     std::vector<std::pair<int, char>> layout_tokens;
     for (auto it = layout.begin(); it != layout.end();) {
       auto start = it;
@@ -352,7 +400,7 @@ class TensorRequisite {
       it++;
     }
 
-    // check applicability of layout
+    // Check applicability of layout.
     auto it = layout_tokens.begin();
     while (it != layout_tokens.end() && it->first == -1) it++;
     int rank = std::distance(layout_tokens.begin(), it);
@@ -365,8 +413,7 @@ class TensorRequisite {
     TVM_FFI_ICHECK_EQ(layout_tokens.size(), origin_dims.size());
     TVM_FFI_ICHECK_EQ(static_cast<size_t>(rank), desired_logic_layout.size()) << layout;
 
-    // Map each logical-dim letter (as it appears in desired_logic_layout) to its resulting
-    // position in the logical shape.
+    // Map each logical-dim letter to its position in the resulting logical shape.
     std::map<char, int> dim_position_by_tag;
     for (size_t i = 0; i < desired_logic_layout.size(); i++)
       dim_position_by_tag[std::toupper(desired_logic_layout[i])] = static_cast<int>(i);
@@ -507,91 +554,6 @@ class TensorRequisite {
   bool IsReversed() const { return reverse_data_flow_; }
 
  private:
-  /*!
-   * \brief Convert a parsed physical layout (as produced by TreatAs()'s tokenizer) into
-   * oneDNN's canonical "abc..."-letter format_tag spelling.
-   *
-   * oneDNN defines every format_tag purely in terms of logical dimension *position*: dim 0 is
-   * always 'a', dim 1 is 'b', and so on -- regardless of what a caller's semantic letters (N, C,
-   * O, G, ...) mean. Domain-specific names like "nchw" or "nChw8c" are just aliases sharing the
-   * same underlying value as their abstract equivalent ("abcd" / "aBcd8b" respectively); the
-   * introspection API this file relies on (dnnl_fmt_tag2str(), see FormatTagsByCanonicalName())
-   * reports only the abstract spelling. So to look a tag up we must first translate into that
-   * form: an outer token's abstract letter is uppercased iff its logical dimension also has a
-   * blocking (inner) component; every inner (blocking) token contributes its block size
-   * followed by the lowercase form of its dimension's abstract letter.
-   *
-   * Example: layout "NCHW8c" with dim_position_by_tag {N:0, C:1, H:2, W:3} canonicalizes to
-   * "aBcd8b" -- exactly the oneDNN spelling for what other parts of the ecosystem call nChw8c.
-   */
-  static std::string CanonicalFormatTagName(const std::vector<std::pair<int, char>>& layout_tokens,
-                                            int rank,
-                                            const std::map<char, int>& dim_position_by_tag) {
-    std::set<char> blocked_semantic_letters;
-    for (size_t i = static_cast<size_t>(rank); i < layout_tokens.size(); i++)
-      blocked_semantic_letters.insert(layout_tokens[i].second);
-
-    std::string canonical;
-    for (size_t i = 0; i < layout_tokens.size(); i++) {
-      const auto& token = layout_tokens[i];
-      char abstract_letter = static_cast<char>('a' + dim_position_by_tag.at(token.second));
-      if (i < static_cast<size_t>(rank)) {
-        // outer token
-        canonical += blocked_semantic_letters.count(token.second)
-                         ? static_cast<char>(std::toupper(abstract_letter))
-                         : abstract_letter;
-      } else {
-        // inner (blocking) token: block size digits followed by lowercase abstract letter
-        canonical += std::to_string(token.first);
-        canonical += abstract_letter;
-      }
-    }
-    return canonical;
-  }
-
-  /*!
-   * \brief Complete, auto-generated reverse lookup from oneDNN's canonical "abc..."-letter
-   * format_tag spelling to the corresponding dnnl::memory::format_tag.
-   *
-   * Built once (lazily, on first use) by iterating every dnnl_format_tag_t value the linked
-   * oneDNN library defines and asking it for its canonical name via the public introspection
-   * function dnnl_fmt_tag2str() (declared with DNNL_API in <dnnl_debug.h>, the same header
-   * oneDNN's own verbose-logging feature is built on). dnnl_format_tag_last is a sentinel
-   * oneDNN itself provides for exactly this purpose, so the loop bound tracks whatever the
-   * linked library version actually supports rather than a value hardcoded here going stale.
-   *
-   * This avoids hand-maintaining a tag table (and the risk of silently missing entries) at the
-   * cost of depending on a "debug" API rather than the primitive-construction API surface;
-   * dnnl_fmt_tag2str is a long-standing, publicly exported, documented part of oneDNN (it is
-   * what powers ONEDNN_VERBOSE output), so this is considered stable to depend on.
-   */
-  static const std::unordered_map<std::string, dnnl::memory::format_tag>&
-  FormatTagsByCanonicalName() {
-    static const std::unordered_map<std::string, dnnl::memory::format_tag> table = [] {
-      std::unordered_map<std::string, dnnl::memory::format_tag> m;
-      // Skip 0 (undef) and 1 (any) -- not real tags. Stop before the sentinel.
-      for (int v = static_cast<int>(dnnl::memory::format_tag::a);
-           v < static_cast<int>(dnnl_format_tag_last); ++v) {
-        const char* name = dnnl_fmt_tag2str(static_cast<dnnl_format_tag_t>(v));
-        if (name == nullptr || name[0] == '\0') continue;
-        // Keep first entry seen for a given name; every distinct format_tag integer value
-        // canonicalizes to a distinct name in oneDNN's own scheme, so collisions are not
-        // expected in practice.
-        m.emplace(std::string(name), static_cast<dnnl::memory::format_tag>(v));
-      }
-      // Sanity net: if dnnl_fmt_tag2str ever behaves unexpectedly (returns nothing
-      // usable, or the loop bound is wrong for some future oneDNN ABI change),
-      // fail loudly at first use instead of silently degrading into "every
-      // TreatAs() call throws not-found" with no clue why.
-      TVM_FFI_ICHECK_GT(m.size(), 100u)
-          << "oneDNN format_tag introspection returned suspiciously few tags (" << m.size()
-          << "). dnnl_fmt_tag2str()/dnnl_format_tag_last may not be "
-             "behaving as expected for this oneDNN build.";
-      return m;
-    }();
-    return table;
-  }
-
   TensorRequisite(const dnnl::memory::desc& t_desc, const std::shared_ptr<TensorRequisite>& orig,
                   bool reinterpret, const dnnl::memory& const_mem, uint32_t eid,
                   bool reverse_data_flow)

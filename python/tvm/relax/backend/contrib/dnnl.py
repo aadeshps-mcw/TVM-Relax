@@ -32,13 +32,37 @@ from tvm.relax.transform import (
     MergeCompositeFunctions,
 )
 
-from ..pattern_registry import Pattern, get_patterns_with_prefix, register_patterns
+from ..pattern_registry import Pattern, register_patterns
 
 
 def _op_pattern(composite_name: str, op_name: str, num_args: int) -> Pattern:
     """A pattern matching a single op called with ``num_args`` wildcard arguments."""
     args = [wildcard() for _ in range(num_args)]
     return (composite_name, is_op(op_name)(*args), {})
+
+
+def _make_conv2d_clip_pattern(with_bias: bool):
+    lhs = wildcard()
+    rhs = wildcard()
+    out = is_op("relax.nn.conv2d")(lhs, rhs)
+    if with_bias:
+        bias = wildcard()
+        out = is_op("relax.add")(out, bias)
+    clip_min = wildcard()
+    clip_max = wildcard()
+    out = is_op("relax.clip")(out, clip_min, clip_max)
+    return out
+
+
+def _ordered_dnnl_patterns() -> list[Pattern]:
+    """Patterns in match-priority order: most specific (largest fused subgraph) first,
+    so FuseOpsByPattern's greedy matching doesn't let a smaller generic pattern
+    (e.g. dnnl.conv2d_bias) pre-empt a larger one (e.g. dnnl.conv2d_bias_relu)
+    that shares the same conv2d+bias prefix."""
+    all_patterns = _dnnl_patterns()
+    # Longer composite name generally implies a more specific / larger pattern here
+    # since we build names as dnnl.<base>[_bias][_<activation>].
+    return sorted(all_patterns, key=lambda p: -len(p[0]))
 
 
 def _dnnl_patterns() -> list[Pattern]:
@@ -49,20 +73,41 @@ def _dnnl_patterns() -> list[Pattern]:
     patterns.append(_op_pattern("dnnl.layer_norm", "relax.nn.layer_norm", 3))
 
     # 2. Fused Ops
-    pat_conv_relu = make_fused_bias_activation_pattern(
-        "relax.nn.conv2d", with_bias=False, activation="relax.nn.relu"
-    )
-    patterns.append(("dnnl.conv2d_relu", pat_conv_relu))
+    _ACTIVATIONS = [
+        ("relu", "relax.nn.relu"),
+        ("tanh", "relax.tanh"),
+        ("sigmoid", "relax.sigmoid"),
+        ("gelu", "relax.nn.gelu"),
+        (
+            "swish",
+            "relax.nn.silu",
+        ),  # silu == swish(beta=1); DNNL runtime keys off "_swish"
+    ]
 
-    pat_conv_bias_relu = make_fused_bias_activation_pattern(
-        "relax.nn.conv2d", with_bias=True, activation="relax.nn.relu"
+    for suffix, act_op in _ACTIVATIONS:
+        pat_bias = make_fused_bias_activation_pattern(
+            "relax.nn.conv2d", with_bias=True, activation=act_op
+        )
+        patterns.append((f"dnnl.conv2d_bias_{suffix}", pat_bias))
+
+        pat_nobias = make_fused_bias_activation_pattern(
+            "relax.nn.conv2d", with_bias=False, activation=act_op
+        )
+        patterns.append((f"dnnl.conv2d_{suffix}", pat_nobias))
+
+    patterns.append(("dnnl.conv2d_clip", _make_conv2d_clip_pattern(with_bias=False)))
+    patterns.append(("dnnl.conv2d_bias_clip", _make_conv2d_clip_pattern(with_bias=True)))
+
+    # Bias-only, no activation.
+    pat_conv_bias = make_fused_bias_activation_pattern(
+        "relax.nn.conv2d", with_bias=True, activation=None
     )
-    patterns.append(("dnnl.conv2d_bias_relu", pat_conv_bias_relu))
+    patterns.append(("dnnl.conv2d_bias", pat_conv_bias))
 
     return patterns
 
 
-register_patterns(_dnnl_patterns())
+register_patterns(sorted(_dnnl_patterns(), key=lambda p: len(p[0])))
 
 
 def partition_for_dnnl(
@@ -99,7 +144,7 @@ def partition_for_dnnl(
     mod = rewrite_layer_norm(mod)
     mod = rewrite_dense_bias_gelu_reshape_last(mod)
 
-    dnnl_patterns = get_patterns_with_prefix("dnnl")
+    dnnl_patterns = _ordered_dnnl_patterns()
 
     byoc_seq = tvm.transform.Sequential(
         [
@@ -223,7 +268,7 @@ def rewrite_dense_bias_gelu_reshape_last(mod: tvm.IRModule) -> tvm.IRModule:
         const3 = wildcard()
 
         den = is_op("relax.matmul")(data_pat, weight_pat)
-        re_den = is_op("relax.reshape")(den, wildcard())
+        re_den = is_op("relax.reshape")(den)
         added = is_op("relax.add")(bias_pat, re_den)
 
         if has_gelu:

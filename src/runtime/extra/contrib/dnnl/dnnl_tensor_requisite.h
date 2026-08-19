@@ -116,10 +116,8 @@ class TensorRequisite {
 
   /*! \brief return logical shape of tensor */
   dnnl::memory::dims dims() const { return t_desc_.get_dims(); }
-  dnnl::memory::dims dims() const { return t_desc_.get_dims(); }
 
   /*! \brief return data type of tensor */
-  dnnl::memory::data_type data_type() const { return t_desc_.get_data_type(); }
   dnnl::memory::data_type data_type() const { return t_desc_.get_data_type(); }
 
   /*! \brief return tensor desc */
@@ -180,7 +178,6 @@ class TensorRequisite {
 
     // numpy like broadcast
     auto extended_dims = t_desc_.get_dims();
-    auto extended_dims = t_desc_.get_dims();
     auto one_filled = dnnl::memory::dims(shape.size() - extended_dims.size(), 1);
     extended_dims.insert(extended_dims.begin(), one_filled.begin(), one_filled.end());
     auto reshaped = t_desc_.reshape(extended_dims);
@@ -205,8 +202,6 @@ class TensorRequisite {
   TensorRequisite Crop(const dnnl::memory::dims& shape, const dnnl::memory::dims& offset) const {
     if (!defined()) return *this;  // nothing for empty TR
 
-    TVM_FFI_ICHECK_EQ(shape.size(), t_desc_.get_dims().size());
-    TVM_FFI_ICHECK_EQ(offset.size(), t_desc_.get_dims().size());
     TVM_FFI_ICHECK_EQ(shape.size(), t_desc_.get_dims().size());
     TVM_FFI_ICHECK_EQ(offset.size(), t_desc_.get_dims().size());
 
@@ -351,8 +346,8 @@ class TensorRequisite {
     if (!defined()) return *this;
     if (desired_logic_layout.empty()) desired_logic_layout = DefaultLogicLayoutFor(layout);
 
-    // origin_dims is the *physical* shape of the tensor as currently stored, e.g. for a
-    // blocked layout like "ABCD8b" this is 5D: {A, B/8, C, D, 8}.
+    // Physical shape of the tensor as currently stored, e.g. for "ABCD8b" this is
+    // 5D: {A, B/8, C, D, 8}.
     const auto origin_dims = dims();
 
     // Split layout string into tokens {size, tag}, e.g. {-1,'N'}, {8,'C'}.
@@ -361,7 +356,6 @@ class TensorRequisite {
       auto start = it;
       while (std::isdigit(*it)) it++;
       int blk_size = start == it ? -1 : std::stoi(std::string{start, it});
-      layout_tokens.push_back({blk_size, static_cast<char>(std::toupper(*it))});
       layout_tokens.push_back({blk_size, static_cast<char>(std::toupper(*it))});
       it++;
     }
@@ -472,7 +466,7 @@ class TensorRequisite {
   std::vector<T> GetConstDataLikeVec() const {
     auto const_data = GetConstData();
     auto desc = const_data.get_desc();
-    TVM_FFI_ICHECK(desc.get_data_type() == utils::DnnlDType<T>());
+    TVM_FFI_ICHECK(desc.get_data_type() == DnnlDType<T>());
     TVM_FFI_ICHECK(desc.get_dims().size() == 1);
 
     auto size = desc.get_size() / sizeof(T);
@@ -488,7 +482,7 @@ class TensorRequisite {
     TVM_FFI_ICHECK(IsScalar());
     auto const_data = GetConstData();
     auto desc = const_data.get_desc();
-    TVM_FFI_ICHECK(desc.get_data_type() == utils::DnnlDType<T>());
+    TVM_FFI_ICHECK(desc.get_data_type() == DnnlDType<T>());
 
     auto ptr = static_cast<T*>(const_data.get_data_handle());
     return *ptr;

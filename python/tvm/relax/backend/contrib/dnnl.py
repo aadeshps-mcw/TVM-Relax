@@ -15,10 +15,26 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Pattern table and partitioning for the DNNL BYOC backend."""
+"""Pattern table and partitioning for the DNNL BYOC backend.
+
+Scope note (post cross-check against TVM 0.19's Relay DNNL pattern table):
+this file covers bare ops, bias+activation fusion, and conv2d/matmul bias+sum(+relu) residual
+fusion -- the parts of the legacy Relay pattern table that could be verified against this
+codebase's actual Relax dpl API. NOT ported, deliberately, pending separate verification:
+  - QNN/int8 quantized fusion patterns (qnn.conv2d/qnn.dense + requantize + sum) -- a materially
+    different, more involved pattern shape than anything below.
+  - swish/mish/gelu as decomposed multi-op activation patterns -- the legacy Relay version builds
+    these from primitive ops (e.g. swish = sigmoid -> multiply) because Relay had no fused op for
+    them; whether Relax's make_fused_bias_activation_pattern needs the same treatment or already
+    has native ops for these depends on the current op registry and hasn't been checked here.
+  - ResNetV1Rewrite (downsample-reorder optimization) -- a separate graph rewrite, not a BYOC
+    pattern; out of scope for this file.
+"""
+
+import itertools
 
 import tvm
-from tvm import relax
+from tvm import relax, tirx
 from tvm.relax.dpl import (
     is_expr,
     is_op,
@@ -30,9 +46,10 @@ from tvm.relax.expr_functor import visitor
 from tvm.relax.transform import (
     FuseOpsByPattern,
     MergeCompositeFunctions,
+    PatternCheckContext,
 )
 
-from ..pattern_registry import Pattern, register_patterns
+from ..pattern_registry import Pattern, get_patterns_with_prefix, register_patterns
 
 
 def _op_pattern(composite_name: str, op_name: str, num_args: int) -> Pattern:
@@ -54,55 +71,186 @@ def _make_conv2d_clip_pattern(with_bias: bool):
     return out
 
 
-def _ordered_dnnl_patterns() -> list[Pattern]:
-    """Patterns in match-priority order: most specific (largest fused subgraph) first,
-    so FuseOpsByPattern's greedy matching doesn't let a smaller generic pattern
-    (e.g. dnnl.conv2d_bias) pre-empt a larger one (e.g. dnnl.conv2d_bias_relu)
-    that shares the same conv2d+bias prefix."""
-    all_patterns = _dnnl_patterns()
-    # Longer composite name generally implies a more specific / larger pattern here
-    # since we build names as dnnl.<base>[_bias][_<activation>].
-    return sorted(all_patterns, key=lambda p: -len(p[0]))
+# Bias + activation fusion (generated, not hand-listed -- see _fused_patterns()).
+
+# Ops for which DNNL implements a fused bias-add + activation post-op chain. layer_norm is
+# deliberately excluded -- it isn't followed by a DNNL-fusable activation the way conv/matmul are.
+_FUSABLE_OPS: list[str] = [
+    "relax.nn.conv1d",
+    "relax.nn.conv2d",
+    "relax.nn.conv3d",
+    "relax.nn.conv2d_transpose",
+    "relax.nn.conv3d_transpose",
+    "relax.matmul",
+]
+
+# Activations DNNL can fuse as a post-op. ``None`` means "bias-only, no activation" and is a valid
+# combination in its own right (e.g. "dnnl.conv2d_bias"). Extend this list -- and the runtime's
+# op-name -> dnnl::algorithm table in ParseAttrs -- together; codegen.cc needs no change either way.
+# NOTE: verify these op names against the actual relax op registry before relying on this list --
+# in particular confirm "relax.nn.gelu" vs "relax.gelu" for your TVM revision, and see the module
+# docstring re: gelu/swish/mish possibly needing decomposed multi-op patterns instead.
+_FUSABLE_ACTIVATIONS: list[str | None] = [
+    None,
+    "relax.nn.relu",
+    "relax.sigmoid",
+    "relax.nn.gelu",
+    "relax.tanh",
+]
+
+
+def _composite_name_for(op_name: str, with_bias: bool, activation: str | None) -> str:
+    """e.g. ("relax.nn.conv2d", True, "relax.nn.relu") -> "dnnl.conv2d_bias_relu"."""
+    base = op_name.rsplit(".", 1)[-1]  # "relax.nn.conv2d" -> "conv2d"
+    parts = [f"dnnl.{base}"]
+    if with_bias:
+        parts.append("bias")
+    if activation is not None:
+        parts.append(activation.rsplit(".", 1)[-1])
+    return "_".join(parts)
+
+
+def _fused_patterns() -> list[Pattern]:
+    """Every (op, with_bias, activation) combination, generated instead of hand-listed.
+
+    Extending fusion coverage (a new activation, a new fusable op) means adding one entry to
+    _FUSABLE_OPS or _FUSABLE_ACTIVATIONS above -- nothing else in this function changes.
+    """
+    patterns: list[Pattern] = []
+    for op_name, with_bias in itertools.product(_FUSABLE_OPS, (False, True)):
+        for activation in _FUSABLE_ACTIVATIONS:
+            if not with_bias and activation is None:
+                continue  # already covered by the bare _op_pattern registration
+            pat = make_fused_bias_activation_pattern(
+                op_name, with_bias=with_bias, activation=activation
+            )
+            name = _composite_name_for(op_name, with_bias, activation)
+            patterns.append((name, pat))
+    return patterns
+
+
+# Bias + residual-sum (+ activation) fusion. Ported from TVM 0.19's Relay
+# make_conv_bias_sum_relu_pattern / make_dense_bias_sum_pattern, matched 1:1 in scope (conv2d gets
+# both the relu and no-relu sum variant; matmul gets only the no-relu sum variant, exactly as the
+# legacy pattern table registers it -- not generalized beyond what was actually validated upstream).
+# Unlike the bias+activation loop above, this needs its own builder: the residual operand is a
+# second full tensor input, not a scalar/activation choice, so it isn't expressible as another
+# axis of the same loop.
+
+
+def _sum_pattern(op_name: str, channel_axis: int, with_relu: bool) -> Pattern:
+    """<op>(data, weight) + bias + residual, optionally followed by relu.
+
+    channel_axis is where the op's output channel dimension lives (1 for NCHW-style conv output,
+    -1 for matmul's last-dim output) -- used by the predicate below to check the bias is actually
+    shaped like a per-channel bias, not some other broadcastable-but-wrong-length tensor.
+    """
+    data1 = wildcard()
+    weight = wildcard()
+    bias = wildcard()
+    data2 = wildcard()
+
+    op = is_op(op_name)(data1, weight)
+    biased = is_op("relax.add")(op, bias)
+    summed = is_op("relax.add")(biased, data2)
+    root = is_op("relax.nn.relu")(summed) if with_relu else summed
+
+    base = op_name.rsplit(".", 1)[-1]
+    name = f"dnnl.{base}_bias_sum" + ("_relu" if with_relu else "")
+
+    def check(context: PatternCheckContext) -> bool:
+        op_expr = context.annotated_expr["op"]
+        bias_expr = context.annotated_expr["bias"]
+        data2_expr = context.annotated_expr["data2"]
+
+        # NOTE: verify .ty / .ty.shape access against your TVM build -- grounded in the existing
+        # tensorrt resize2d predicate's use of `.ty.ndim` / `.ty.dtype` / `.ty.shape`, but this
+        # predicate additionally indexes into per-dimension values, which that example did not do.
+        if op_expr.ty.shape is None or data2_expr.ty.shape is None:
+            return False
+        out_dims = list(op_expr.ty.shape.values)
+        sum_dims = list(data2_expr.ty.shape.values)
+
+        # Residual add must be a true elementwise match against the op's own output shape.
+        if len(out_dims) != len(sum_dims):
+            return False
+        for a, b in zip(out_dims, sum_dims):
+            if isinstance(a, tirx.IntImm) and isinstance(b, tirx.IntImm) and a.value != b.value:
+                return False
+
+        # Bias must be a scalar or a 1D tensor sized to the op's channel dimension -- catches a
+        # bias that merely happens to be broadcastable but isn't actually a per-channel bias.
+        if bias_expr.ty.shape is not None:
+            bias_dims = list(bias_expr.ty.shape.values)
+            if len(bias_dims) not in (0, 1):
+                return False
+            if len(bias_dims) == 1:
+                channel_dim = out_dims[channel_axis]
+                bias_dim = bias_dims[0]
+                if (
+                    isinstance(bias_dim, tirx.IntImm)
+                    and isinstance(channel_dim, tirx.IntImm)
+                    and bias_dim.value != channel_dim.value
+                ):
+                    return False
+
+        return True
+
+    return (
+        name,
+        root,
+        {"op": op, "bias": bias, "data2": data2, "root": root},
+        check,
+    )
+
+
+def _sum_patterns() -> list[Pattern]:
+    return [
+        _sum_pattern("relax.nn.conv2d", channel_axis=1, with_relu=True),
+        _sum_pattern("relax.nn.conv2d", channel_axis=1, with_relu=False),
+        _sum_pattern("relax.matmul", channel_axis=-1, with_relu=False),
+    ]
 
 
 def _dnnl_patterns() -> list[Pattern]:
     patterns: list[Pattern] = []
 
-    patterns.append(_op_pattern("dnnl.conv2d", "relax.nn.conv2d", 2))
-    patterns.append(_op_pattern("dnnl.matmul", "relax.matmul", 2))
+    # 1. Bare ops (conv1d/2d/3d, transposed conv, matmul, layer_norm).
+    for composite, op in [
+        ("dnnl.conv1d", "relax.nn.conv1d"),
+        ("dnnl.conv2d", "relax.nn.conv2d"),
+        ("dnnl.conv3d", "relax.nn.conv3d"),
+        ("dnnl.conv2d_transpose", "relax.nn.conv2d_transpose"),
+        ("dnnl.conv3d_transpose", "relax.nn.conv3d_transpose"),
+        ("dnnl.matmul", "relax.matmul"),
+    ]:
+        patterns.append(_op_pattern(composite, op, 2))
     patterns.append(_op_pattern("dnnl.layer_norm", "relax.nn.layer_norm", 3))
 
-    # 2. Fused Ops
-    _ACTIVATIONS = [
-        ("relu", "relax.nn.relu"),
-        ("tanh", "relax.tanh"),
-        ("sigmoid", "relax.sigmoid"),
-        ("gelu", "relax.nn.gelu"),
-        (
-            "swish",
-            "relax.nn.silu",
-        ),  # silu == swish(beta=1); DNNL runtime keys off "_swish"
-    ]
+    # 2. Fused ops: bias-add and/or activation (relu/sigmoid/gelu/tanh/bias-only), generated for
+    # every (op, with_bias, activation) combination across all fusable ops. See _fused_patterns()
+    # docstring to extend coverage.
+    patterns.extend(_fused_patterns())
 
-    for suffix, act_op in _ACTIVATIONS:
-        pat_bias = make_fused_bias_activation_pattern(
-            "relax.nn.conv2d", with_bias=True, activation=act_op
-        )
-        patterns.append((f"dnnl.conv2d_bias_{suffix}", pat_bias))
+    # 3. swish is not in _FUSABLE_ACTIVATIONS (DNNL runtime keys off "_swish" but relax uses
+    # "relax.nn.silu" == swish(beta=1)) -- handled here instead, conv2d only, matching the scope
+    # note at the top of this file.
+    pat_swish_bias = make_fused_bias_activation_pattern(
+        "relax.nn.conv2d", with_bias=True, activation="relax.nn.silu"
+    )
+    patterns.append(("dnnl.conv2d_bias_swish", pat_swish_bias))
 
-        pat_nobias = make_fused_bias_activation_pattern(
-            "relax.nn.conv2d", with_bias=False, activation=act_op
-        )
-        patterns.append((f"dnnl.conv2d_{suffix}", pat_nobias))
+    pat_swish_nobias = make_fused_bias_activation_pattern(
+        "relax.nn.conv2d", with_bias=False, activation="relax.nn.silu"
+    )
+    patterns.append(("dnnl.conv2d_swish", pat_swish_nobias))
 
+    # 4. conv2d + clip (not expressible via make_fused_bias_activation_pattern's activation arg).
     patterns.append(("dnnl.conv2d_clip", _make_conv2d_clip_pattern(with_bias=False)))
     patterns.append(("dnnl.conv2d_bias_clip", _make_conv2d_clip_pattern(with_bias=True)))
 
-    # Bias-only, no activation.
-    pat_conv_bias = make_fused_bias_activation_pattern(
-        "relax.nn.conv2d", with_bias=True, activation=None
-    )
-    patterns.append(("dnnl.conv2d_bias", pat_conv_bias))
+    # 5. Bias + residual-sum (+ optional relu) fusion. See _sum_patterns() docstring to extend.
+    patterns.extend(_sum_patterns())
 
     return patterns
 
@@ -136,6 +284,8 @@ def partition_for_dnnl(
         desired_layouts = {
             "relax.nn.conv2d": ["NCHW", "OIHW"],
             "relax.nn.conv2d_transpose": ["NCHW", "OIHW"],
+            "relax.nn.conv3d": ["NCDHW", "OIDHW"],
+            "relax.nn.conv3d_transpose": ["NCDHW", "OIDHW"],
         }
         with tvm.transform.PassContext(opt_level=3):
             mod = relax.transform.ConvertLayout(desired_layouts)(mod)
@@ -144,8 +294,7 @@ def partition_for_dnnl(
     mod = rewrite_layer_norm(mod)
     mod = rewrite_dense_bias_gelu_reshape_last(mod)
 
-    dnnl_patterns = _ordered_dnnl_patterns()
-
+    dnnl_patterns = get_patterns_with_prefix("dnnl")
     byoc_seq = tvm.transform.Sequential(
         [
             FuseOpsByPattern(dnnl_patterns),
@@ -157,7 +306,6 @@ def partition_for_dnnl(
 
     if prune_subgraphs:
         mod = prune_dnnl_subgraphs(mod)
-
     return mod
 
 

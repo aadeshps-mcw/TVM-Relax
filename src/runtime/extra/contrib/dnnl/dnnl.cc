@@ -129,10 +129,6 @@ void dnnl_conv2d_common(float* data, float* weights, float* bias, float* out, in
       eng, prop_kind::forward_inference, algorithm::convolution_direct, conv2d_src_md,
       conv2d_weights_md, conv2d_bias_md, conv2d_dst_md, conv2d_strides, conv2d_padding0,
       conv2d_padding1, attr);
-  auto conv2d_prim_desc = convolution_forward::primitive_desc(
-      eng, prop_kind::forward_inference, algorithm::convolution_direct, conv2d_src_md,
-      conv2d_weights_md, conv2d_bias_md, conv2d_dst_md, conv2d_strides, conv2d_padding0,
-      conv2d_padding1, attr);
 
   // reorder if src layout not DNNL chosen.
   auto conv2d_src_memory = user_src_memory;

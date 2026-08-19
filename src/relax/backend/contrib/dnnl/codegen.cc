@@ -20,10 +20,29 @@
 /*!
  * \file src/relax/backend/contrib/dnnl/codegen.cc
  * \brief Implementation of the DNNL JSON serializer.
+ *
+ * Unlike TensorRT's composite functions (which always wrap exactly one primitive op), a DNNL
+ * composite represents a *fused chain* -- e.g. "dnnl.conv2d_bias_relu" contains three primitive
+ * calls: conv2d, add (bias), relu. So there is no single "root call" to resolve by name.
+ * Baseline for this file is TensorRT's codegen.cc: instead of matching composite_name (or an op
+ * name) against a table to decide which call to extract attrs from, we walk every binding in the
+ * composite body once and, for every primitive call found:
+ *   - copy its op attrs via the existing SetCallNodeAttribute() helper (same helper the original
+ *     conv2d-only code used for its single root_call)
+ *   - serialize its non-tensor scalar/shape arguments as "arg_<name>" attrs -- this is what
+ *     replaces the old hardcoded "_clip" check; relax.clip's min/max are call args, not attrs,
+ *     and this now applies to any op with such args, not just clip
+ *   - append its op name to a "fused_ops" attr, so the runtime knows the fusion sequence without
+ *     codegen needing a hardcoded list of which ops DNNL supports as post-ops
+ * The leaf-tensor-input-gathering logic below (param_entries / add_leaf_if_new) was already fully
+ * generic before this change and is unmodified in spirit -- it's folded into the same single walk
+ * of the composite body's bindings so the body is only traversed once.
  */
 #include <tvm/ffi/cast.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/module.h>
+#include <tvm/ir/op.h>
+#include <tvm/relax/expr.h>
 
 #include <string>
 #include <unordered_map>
@@ -40,6 +59,7 @@ namespace contrib {
 
 using JSONGraphNode = tvm::runtime::json::JSONGraphNode;
 using JSONGraphNodeEntry = tvm::runtime::json::JSONGraphNodeEntry;
+using JSONGraphObjectPtr = backend::contrib::JSONGraphObjectPtr;
 using JSONSerializer = backend::contrib::JSONSerializer;
 using backend::contrib::NodeEntries;
 namespace {
@@ -98,7 +118,6 @@ class DNNLJSONSerializer : public JSONSerializer {
 
     auto composite_opt = fn->GetAttr<ffi::String>(attr::kComposite);
     TVM_FFI_ICHECK(composite_opt.has_value()) << "Only composite functions are supported.";
-
     std::string composite_name = composite_opt.value();
 
     // Map each composite-function parameter to the entries already produced
@@ -178,8 +197,8 @@ class DNNLJSONSerializer : public JSONSerializer {
       node->SetAttr("a_min", min_imm->value);
       node->SetAttr("a_max", max_imm->value);
     }
+    node->SetAttr("fused_ops", std::move(fused_ops));
 
-    SetCallNodeAttribute(node, root_call);
     return AddNode(node, ffi::GetRef<Expr>(call_node));
   }
 

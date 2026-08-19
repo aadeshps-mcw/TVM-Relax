@@ -145,13 +145,15 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
       {"sqrt", dnnl::algorithm::eltwise_sqrt},
       {"round", dnnl::algorithm::eltwise_round},
       // {"logsumexp", dnnl::algorithm::eltwise_logsigmoid},
-      // {"logsumexp", dnnl::algorithm::eltwise_logsigmoid},
       {"nn.relu", dnnl::algorithm::eltwise_relu},
-      {"nn.leaky_relu", dnnl::algorithm::eltwise_relu},
+      // {"nn.leaky_relu", dnnl::algorithm::eltwise_relu},
       {"tanh", dnnl::algorithm::eltwise_tanh},
       {"sigmoid", dnnl::algorithm::eltwise_logistic},
-      {"clip", dnnl::algorithm::eltwise_clip},
-      {"gelu_erf", dnnl::algorithm::eltwise_gelu_erf},
+      {"nn.swish", dnnl::algorithm::eltwise_swish},
+      {"nn.mish", dnnl::algorithm::eltwise_mish},
+      {"nn.gelu", dnnl::algorithm::eltwise_gelu_erf},
+      // {"clip", dnnl::algorithm::eltwise_clip},
+      // {"gelu_erf", dnnl::algorithm::eltwise_gelu_erf},
   };
 
   dnnl::primitive_attr ParseAttrs(const size_t& nid, TensorRequisite* bias_tr,
@@ -172,8 +174,8 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     auto activation = GetNodeAttr<std::vector<std::string>>(nodes_[nid], "activation", {"none"});
     if (activation[0] != "none") {
       auto a_type = elt_name2algo.at(activation[0]);
-      auto a_alfa = GetInput(nid, std::stoi(activation[2])).GetConstScalarData<float>();
-      auto a_beta = GetInput(nid, std::stoi(activation[3])).GetConstScalarData<float>();
+      auto a_alfa = GetInput(nid, std::stoi(activation[1])).GetConstScalarData<float>();
+      auto a_beta = GetInput(nid, std::stoi(activation[2])).GetConstScalarData<float>();
 
       auto ops = attr.get_post_ops();
       ops.append_eltwise(a_type, a_alfa, a_beta);
@@ -218,6 +220,11 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
       float a_max = GetNodeAttr<float>(nodes_[nid], "a_max");
       ops.append_eltwise(dnnl::algorithm::eltwise_clip, a_min, a_max);
     }
+    // if (contains(op_name, "_clip")) {
+    //   float a_min = GetNodeAttr<float>(nodes_[nid], "a_min");
+    //   float a_max = GetNodeAttr<float>(nodes_[nid], "a_max");
+    //   ops.append_eltwise(dnnl::algorithm::eltwise_clip, a_min, a_max);
+    // }
     if (contains(op_name, "_sigmoid")) {
       ops.append_eltwise(dnnl::algorithm::eltwise_logistic, 0.f, 0.f);
     }
@@ -256,6 +263,8 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
         auto op_name = node.GetOpName();
         if (contains_any(op_name, "conv1d", "conv2d", "conv3d")) {
           Convolution(nid);
+        } else if (contains_any(op_name, "conv2d_transpose", "conv3d_transpose")) {
+          Deconvolution(nid);
         } else if (contains(op_name, "dense")) {
           Dense(nid);
         } else if ("nn.batch_norm" == op_name) {
@@ -279,39 +288,8 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
         } else if ("nn.batch_matmul" == op_name) {
           BatchMatMul(nid);
         } else {
-          TVM_FFI_THROW(InternalError)
-              << "Unsupported op during porting (only conv2d is active): " << op_name;
+          TVM_FFI_THROW(InternalError) << "Unsupported op: " << op_name;
         }
-
-        // if (contains_any(op_name, "deconv1d", "deconv2d", "deconv3d", "conv1d_transpose",
-        //                  "conv2d_transpose", "conv3d_transpose")) {
-        //   Deconvolution(nid);
-        // } else if (contains_any(op_name, "conv1d", "conv2d", "conv3d")) {
-        //   std::cout<<"found conv\n";
-        //   Convolution(nid);
-        // } else if (contains(op_name, "dense")) {
-        //   Dense(nid);
-        // } else if ("nn.batch_norm" == op_name) {
-        //   BatchNorm(nid);
-        // } else if (contains_any(op_name, "max_pool1d", "max_pool2d", "max_pool3d")) {
-        //   Pooling(nid, dnnl::algorithm::pooling_max);
-        // } else if (contains_any(op_name, "avg_pool1d", "avg_pool2d", "avg_pool3d")) {
-        //   Pooling(nid, dnnl::algorithm::pooling_avg);
-        // } else if (elt_name2algo.count(op_name)) {
-        //   Eltwise(nid);
-        // } else if ("nn.softmax" == op_name) {
-        //   Softmax(nid);
-        // } else if ("add" == op_name) {
-        //   Binary(nid, dnnl::algorithm::binary_add);
-        // } else if ("multiply" == op_name) {
-        //   Binary(nid, dnnl::algorithm::binary_mul);
-        // } else if ("nn.layer_norm" == op_name) {
-        //   LayerNorm(nid);
-        // } else if ("nn.batch_matmul" == op_name) {
-        //   BatchMatMul(nid);
-        // } else {
-        //   TVM_FFI_THROW(InternalError) << "Unsupported op: " << op_name;
-        // }
       }
     }
   }
@@ -442,8 +420,6 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
 
     // Minus one for DNNL representation. No dilation for DNNL is 0, for relax is 1.
     for (auto& d : dilates) d--;
-
-    // Take into account provided layout strings
     src_tr = src_tr.TreatAs(src_layout);
     dst_tr = dst_tr.TreatAs(dst_layout);
     wgh_tr = wgh_tr.TreatAs(wgh_layout);
@@ -455,8 +431,6 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
       w_dims.insert(w_dims.begin(), groups);
       wgh_tr = wgh_tr.Reshape(w_dims);
     }
-
-    // Assumption that bias is correct and can be squeezed to 1D
     bias_tr = bias_tr.Reshape({dst_tr.dims()[1]});
 
     // Conv description.

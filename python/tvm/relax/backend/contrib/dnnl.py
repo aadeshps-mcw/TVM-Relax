@@ -122,7 +122,7 @@ _CONV_LAYOUT_QUERY_SPECS: dict[str, tuple[int, bool, list[str]]] = {
 # Ops that count as real DNNL compute for prune_dnnl_subgraphs (see _count_compute_ops).
 # Deliberately excludes bare elementwise/add/multiply -- a standalone region built from
 # only those isn't worth offloading; see test_prune_subgraphs_demotes_light_ops.
-
+# For Unit testing the following individual ops uncomment the required ops
 _DNNL_COMPUTE_OPS = {
     "relax.nn.conv1d",
     "relax.nn.conv2d",
@@ -292,6 +292,17 @@ def _validate_eltwise_op_name(op_name: str) -> None:
 def dnnl_pooling_checker(ctx) -> bool:
     call = ctx.matched_expr
     if hasattr(call.attrs, "ceil_mode") and call.attrs.ceil_mode:
+        return False
+    return _reject_int64(call)
+
+
+def dnnl_batch_norm_checker(ctx) -> bool:
+    """oneDNN's batch_normalization_forward primitive is built with use_global_stats, i.e. it
+    always normalizes using the supplied mean/var directly (inference semantics). A training=True
+    call instead computes live batch statistics from the data and only uses mean/var to produce
+    updated running averages -- a different computation this backend can't express."""
+    call = ctx.matched_expr
+    if hasattr(call.attrs, "training") and call.attrs.training:
         return False
     return _reject_int64(call)
 
@@ -535,7 +546,9 @@ def _standalone_patterns() -> list[Pattern]:
     patterns.append(_op_pattern("dnnl.softmax", "relax.nn.softmax", 1))
     patterns.append(_op_pattern("dnnl.add", "relax.add", 2))
     patterns.append(_op_pattern("dnnl.multiply", "relax.multiply", 2))
-    patterns.append(_op_pattern("dnnl.batch_norm", "relax.nn.batch_norm", 5))
+    patterns.append(
+        _op_pattern("dnnl.batch_norm", "relax.nn.batch_norm", 5, dnnl_batch_norm_checker)
+    )
     patterns.append(
         _op_pattern(
             "dnnl.global_avg_pool2d",
@@ -956,7 +969,10 @@ def rewrite_batch_norm(mod: tvm.IRModule) -> tvm.IRModule:
         var = matches[var_pat]
         gamma = matches[gamma_pat]
         beta = matches[beta_pat]
-        bn_out = relax.op.nn.batch_norm(x, gamma, beta, mean, var, axis=1)
+        eps = float(matches[eps_pat].data.numpy())
+        bn_out = relax.op.nn.batch_norm(
+            x, gamma, beta, mean, var, axis=1, epsilon=eps, training=False
+        )
         return relax.TupleGetItem(bn_out, 0)
 
     new_mod = tvm.IRModule(mod.functions)

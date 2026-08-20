@@ -169,13 +169,6 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     auto o_scl_tr = GetInputByName(nid, "o_scl_idx");
     auto sum_scl_tr = GetInputByName(nid, "sum_scl_idx");
 
-    if (o_scl_tr) {
-      TVM_FFI_ICHECK(o_scl_tr.IsConstant());
-      auto data = o_scl_tr.GetConstDataLikeVec<float>();
-      attr.set_scales_mask(DNNL_ARG_DST, data.size() == 1 ? 0 : (1 << 1));
-      *o_scl_tr_out = o_scl_tr;
-    }
-
     auto activation = GetNodeAttr<std::vector<std::string>>(nodes_[nid], "activation", {"none"});
     if (activation[0] != "none") {
       TVM_FFI_ICHECK(elt_name2algo.count(activation[0]))
@@ -616,13 +609,15 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
       sum_in_tr = GetInput(nid, node.GetInputs().size() - 1);
     }
 
-    Submit(dnnl::matmul(matmul_prim_desc),
-           {{DNNL_ARG_SRC, src_tr},
-            {DNNL_ARG_WEIGHTS, wgh_tr},
-            {DNNL_ARG_BIAS, bias_tr},
-            {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
-            {DNNL_ARG_DST, dst_tr}},
-           {sum_in_tr, DNNL_ARG_DST});
+    std::unordered_map<int, TensorRequisite> matmul_args = {{DNNL_ARG_SRC, src_tr},
+                                                            {DNNL_ARG_WEIGHTS, wgh_tr},
+                                                            {DNNL_ARG_BIAS, bias_tr},
+                                                            {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
+                                                            {DNNL_ARG_DST, dst_tr}};
+    if (scale_post_op_idx >= 0) {
+      matmul_args[DNNL_ARG_ATTR_MULTIPLE_POST_OP(scale_post_op_idx) | DNNL_ARG_SRC_1] = o_scl_tr;
+    }
+    Submit(dnnl::matmul(matmul_prim_desc), matmul_args, {sum_in_tr, DNNL_ARG_DST});
   }
 
   void BatchMatMul(const size_t& nid) {

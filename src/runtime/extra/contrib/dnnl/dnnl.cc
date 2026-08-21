@@ -30,7 +30,6 @@
 
 #include <algorithm>
 #include <iostream>
-#include <numeric>
 #include <string>
 #include <vector>
 
@@ -126,10 +125,10 @@ void dnnl_conv2d_common(float* data, float* weights, float* bias, float* out, in
   auto conv2d_dst_md =
       memory::desc({conv2d_dst_tz}, (pre_cast && post_cast) ? dt::f32 : dt::bf16, tag::any);
 
-  auto conv2d_desc = convolution_forward::desc(
-      prop_kind::forward_inference, algorithm::convolution_direct, conv2d_src_md, conv2d_weights_md,
-      conv2d_bias_md, conv2d_dst_md, conv2d_strides, conv2d_padding0, conv2d_padding1);
-  auto conv2d_prim_desc = convolution_forward::primitive_desc(conv2d_desc, attr, eng);
+  auto conv2d_prim_desc = convolution_forward::primitive_desc(
+      eng, prop_kind::forward_inference, algorithm::convolution_direct, conv2d_src_md,
+      conv2d_weights_md, conv2d_bias_md, conv2d_dst_md, conv2d_strides, conv2d_padding0,
+      conv2d_padding1, attr);
 
   // reorder if src layout not DNNL chosen.
   auto conv2d_src_memory = user_src_memory;
@@ -180,7 +179,7 @@ extern "C" void dnnl_conv2d(float* data, float* weights, float* out, int p_N_, i
 
 primitive_attr create_attr_with_relu_post_op() {
   post_ops ops;
-  ops.append_eltwise(1.f, algorithm::eltwise_relu, 0.f, 0.f);
+  ops.append_eltwise(algorithm::eltwise_relu, 0.f, 0.f);
 
   primitive_attr attr;
   attr.set_post_ops(ops);
@@ -231,9 +230,8 @@ extern "C" void dnnl_dense(float* data, float* weight, float* out, int p_B_, int
   auto bias_memory = memory(bias_md, eng, bias.data());
   auto dst_memory = memory(dst_md, eng);
 
-  auto dense_desc = inner_product_forward::desc(prop_kind::forward_inference, data_md, weight_md,
-                                                bias_md, dst_md);
-  auto dense_prim_desc = inner_product_forward::primitive_desc(dense_desc, eng);
+  auto dense_prim_desc = inner_product_forward::primitive_desc(eng, prop_kind::forward_inference,
+                                                               data_md, weight_md, bias_md, dst_md);
   assert(dst_md == dense_prim_desc.dst_desc());
 
   auto dense = inner_product_forward(dense_prim_desc);
@@ -256,9 +254,8 @@ extern "C" void dnnl_relu(float* data, float* out, std::vector<int64_t> shape) {
   auto data_memory = memory(data_md, eng, data);
   auto dst_memory = memory(data_md, eng);
 
-  auto relu_desc =
-      eltwise_forward::desc(prop_kind::forward_inference, algorithm::eltwise_relu, data_md, 0);
-  auto relu_prim_desc = eltwise_forward::primitive_desc(relu_desc, eng);
+  auto relu_prim_desc = eltwise_forward::primitive_desc(
+      eng, prop_kind::forward_inference, algorithm::eltwise_relu, data_md, data_md, 0.f, 0.f);
   assert(data_md == relu_prim_desc.dst_desc());
 
   auto relu = eltwise_forward(relu_prim_desc);
@@ -283,29 +280,27 @@ extern "C" void dnnl_bn(float* data, float* gamma, float* beta, float* mean, flo
   auto data_memory = memory(data_md, eng, data);
   auto dst_memory = memory(data_md, eng);
 
-  auto bn_desc = batch_normalization_forward::desc(
-      prop_kind::forward_inference, data_md, p_E_,
-      normalization_flags::use_global_stats | normalization_flags::use_scale_shift);
-  auto bn_prim_desc = batch_normalization_forward::primitive_desc(bn_desc, eng);
+  auto bn_prim_desc = batch_normalization_forward::primitive_desc(
+      eng, prop_kind::forward_inference, data_md, data_md, p_E_,
+      normalization_flags::use_global_stats | normalization_flags::use_scale |
+          normalization_flags::use_shift);
   assert(data_md == bn_prim_desc.dst_desc());
 
-  float* weight = reinterpret_cast<float*>(malloc(sizeof(float) * 2 * p_C_));
-  memcpy(weight, gamma, sizeof(float) * p_C_);
-  memcpy(weight + p_C_, beta, sizeof(float) * p_C_);
-
-  auto weight_memory = memory(bn_prim_desc.weights_desc(), eng, weight);
+  auto scale_shift_md = memory::desc({{p_C_}, dt::f32, tag::a});
+  auto scale_memory = memory(scale_shift_md, eng, gamma);
+  auto shift_memory = memory(scale_shift_md, eng, beta);
   auto mean_memory = memory(bn_prim_desc.mean_desc(), eng, mean);
   auto variance_memory = memory(bn_prim_desc.variance_desc(), eng, variance);
 
   auto bn = batch_normalization_forward(bn_prim_desc);
   bn.execute(s, {{DNNL_ARG_SRC, data_memory},
                  {DNNL_ARG_DST, dst_memory},
-                 {DNNL_ARG_SCALE_SHIFT, weight_memory},
+                 {DNNL_ARG_SCALE, scale_memory},
+                 {DNNL_ARG_SHIFT, shift_memory},
                  {DNNL_ARG_MEAN, mean_memory},
                  {DNNL_ARG_VARIANCE, variance_memory}});
   s.wait();
   read_from_dnnl_memory(out, dst_memory);
-  free(weight);
 }
 
 #define DNNL_BINARY_ADD 0
@@ -337,8 +332,7 @@ extern "C" void dnnl_binary_op(float* data, float* weight, float* out, int algo_
       break;
   }
 
-  auto add_desc = binary::desc(algo, data_md, data_md, data_md);
-  auto add_prim_desc = binary::primitive_desc(add_desc, eng);
+  auto add_prim_desc = binary::primitive_desc(eng, algo, data_md, data_md, data_md);
   assert(data_md == add_prim_desc.dst_desc());
 
   auto add = binary(add_prim_desc);

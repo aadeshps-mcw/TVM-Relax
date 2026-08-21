@@ -42,22 +42,26 @@ def _dnnl_regions(mod):
 
 def _composite_names(mod):
     names = []
+    seen_funcs = set()
 
     def _collect(func):
+        if id(func) in seen_funcs:
+            return
+        seen_funcs.add(id(func))
         if func.attrs is not None and func.attrs.get("Composite") is not None:
             names.append(str(func.attrs.get("Composite")))
-        seq = func.body if isinstance(func.body, relax.SeqExpr) else None
-        if seq is None:
-            return
-        for block in seq.blocks:
-            for binding in block.bindings:
-                value = getattr(binding, "value", None)
-                if isinstance(value, relax.Function):
-                    _collect(value)
 
-    for func in mod.functions.values():
-        if isinstance(func, relax.Function):
-            _collect(func)
+        def _visit(expr):
+            if isinstance(expr, relax.Function):
+                _collect(expr)
+            elif isinstance(expr, relax.Call) and isinstance(expr.op, relax.Function):
+                _collect(expr.op)
+
+        relax.analysis.post_order_visit(func.body, _visit)
+
+    for f in mod.functions.values():
+        if isinstance(f, relax.Function):
+            _collect(f)
     return names
 
 

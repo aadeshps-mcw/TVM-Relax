@@ -507,13 +507,15 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
 
     auto scratchpad_tr = TensorRequisite::AsIs(deconv_prim_desc.scratchpad_desc());
 
-    Submit(dnnl::deconvolution_forward(deconv_prim_desc),
-           {{DNNL_ARG_SRC, src_tr},
-            {DNNL_ARG_WEIGHTS, wgh_tr},
-            {DNNL_ARG_BIAS, bias_tr},
-            {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
-            {DNNL_ARG_DST, dst_tr},
-            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, o_scl_tr}});
+    std::unordered_map<int, TensorRequisite> deconv_args = {{DNNL_ARG_SRC, src_tr},
+                                                            {DNNL_ARG_WEIGHTS, wgh_tr},
+                                                            {DNNL_ARG_BIAS, bias_tr},
+                                                            {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
+                                                            {DNNL_ARG_DST, dst_tr}};
+    if (scale_post_op_idx >= 0) {
+      deconv_args[DNNL_ARG_ATTR_MULTIPLE_POST_OP(scale_post_op_idx) | DNNL_ARG_SRC_1] = o_scl_tr;
+    }
+    Submit(dnnl::deconvolution_forward(deconv_prim_desc), deconv_args);
   }
 
   void Dense(const size_t& nid) {
@@ -554,14 +556,15 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
       sum_in_tr = GetInput(nid, node.GetInputs().size() - 1);
     }
 
-    Submit(dnnl::inner_product_forward(dense_prim_desc),
-           {{DNNL_ARG_SRC, src_tr},
-            {DNNL_ARG_WEIGHTS, wgh_tr},
-            {DNNL_ARG_BIAS, bias_tr},
-            {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
-            {DNNL_ARG_DST, dst_tr},
-            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, o_scl_tr}},
-           {sum_in_tr, DNNL_ARG_DST});
+    std::unordered_map<int, TensorRequisite> dense_args = {{DNNL_ARG_SRC, src_tr},
+                                                           {DNNL_ARG_WEIGHTS, wgh_tr},
+                                                           {DNNL_ARG_BIAS, bias_tr},
+                                                           {DNNL_ARG_SCRATCHPAD, scratchpad_tr},
+                                                           {DNNL_ARG_DST, dst_tr}};
+    if (scale_post_op_idx >= 0) {
+      dense_args[DNNL_ARG_ATTR_MULTIPLE_POST_OP(scale_post_op_idx) | DNNL_ARG_SRC_1] = o_scl_tr;
+    }
+    Submit(dnnl::inner_product_forward(dense_prim_desc), dense_args, {sum_in_tr, DNNL_ARG_DST});
   }
 
   void MatMul(const size_t& nid) {

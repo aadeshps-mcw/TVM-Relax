@@ -321,7 +321,9 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
         } else if (contains_any(op_name, "max_pool1d", "max_pool2d", "max_pool3d")) {
           Pooling(nid, dnnl::algorithm::pooling_max);
         } else if (contains_any(op_name, "avg_pool1d", "avg_pool2d", "avg_pool3d")) {
-          Pooling(nid, dnnl::algorithm::pooling_avg_exclude_padding);
+          bool count_include_pad = GetNodeAttr<bool>(nodes_[nid], "count_include_pad");
+          Pooling(nid, count_include_pad ? dnnl::algorithm::pooling_avg_include_padding
+                                         : dnnl::algorithm::pooling_avg_exclude_padding);
         } else if (elt_name2algo.count(stripped_op_name)) {
           Eltwise(nid);
         } else if ("softmax" == stripped_op_name) {

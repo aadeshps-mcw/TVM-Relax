@@ -333,6 +333,57 @@ def test_dnnl_pooling(op_name):
     _check(mod, args)
 
 
+@pytest.mark.parametrize("count_include_pad", [True, False])
+def test_dnnl_avg_pool2d_count_include_pad(count_include_pad):
+    # Regression test: dnnl_json_runtime.cc's avg-pool dispatch previously hardcoded
+    # pooling_avg_exclude_padding regardless of what Relax's count_include_pad attribute said.
+    # Padding must be non-zero here for the two algorithms to actually diverge -- with zero
+    # padding no window ever touches a padded cell, so include vs exclude give identical results
+    # either way and this wouldn't exercise the bug at all.
+    data_shape = (1, 4, 8, 8)
+
+    def body(bb, data):
+        return bb.emit(
+            relax.op.nn.avg_pool2d(
+                data,
+                pool_size=(3, 3),
+                strides=(2, 2),
+                padding=(1, 1),
+                count_include_pad=count_include_pad,
+            )
+        )
+
+    mod = _build_module([("data", data_shape, "float32")], body)
+    args = [_rand(data_shape)]
+    _check(mod, args)
+
+
+def test_dnnl_pad_avg_pool2d_fusion():
+    # Exercises rewrite_pad_avg_pool2d: a separate zero-constant nn.pad immediately followed by an
+    # avg_pool2d (with its own padding=0) gets folded into a single avg_pool2d call with the pad
+    # width moved into its own padding attribute. The rewritten call is built with
+    # count_include_pad=True specifically to reproduce the original two-step graph's implicit
+    # "pad first, then pool with padding=0" divisor -- this is the exact case that depends on
+    # count_include_pad actually being honored by the runtime.
+    data_shape = (1, 4, 8, 8)
+
+    def body(bb, data):
+        padded = bb.emit(
+            relax.op.nn.pad(
+                data, pad_width=[0, 0, 0, 0, 1, 1, 1, 1], pad_mode="constant", pad_value=0.0
+            )
+        )
+        return bb.emit(relax.op.nn.avg_pool2d(padded, pool_size=(3, 3), strides=(2, 2)))
+
+    mod = _build_module([("data", data_shape, "float32")], body)
+    args = [_rand(data_shape)]
+
+    partitioned = partition_for_dnnl(mod, run_codegen=False)
+    assert "dnnl.avg_pool2d" in _dnnl_composite_names(partitioned)
+
+    _check(mod, args)
+
+
 # Remaining standalone patterns: softmax, add, multiply, batch_norm, and true global average pool
 
 
